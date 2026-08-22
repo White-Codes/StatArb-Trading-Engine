@@ -48,27 +48,38 @@ UNIVERSE = [
 #  DATA LOADING
 # ─────────────────────────────────────────────
 def load_price_series(symbol: str, timeframe: str = "H1") -> pd.Series:
-    """Load close prices for a symbol with flexible column detection."""
+    """Load close prices supporting Dukascopy and standard CSV formats."""
     fname = os.path.join(DATA_DIR, f"{symbol}_{timeframe}.csv")
     if not os.path.exists(fname):
         print(f"  [MISS] {fname}")
         return pd.Series(dtype=float)
 
-    df = pd.read_csv(fname)
-    
-    # Flexible column matching to handle MT5 or standard exports
-    date_col = next((c for c in ['time', 'Time', 'date', 'Date', '<DATE>'] if c in df.columns), None)
-    close_col = next((c for c in ['close', 'Close', '<CLOSE>'] if c in df.columns), None)
+    try:
+        # Read CSV file
+        df = pd.read_csv(fname)
+        
+        # Clean column names (strip spaces, lowercase)
+        df.columns = [c.strip().lower() for c in df.columns]
 
-    if not date_col or not close_col:
-        print(f"  [ERR] Invalid column structure in {fname}")
+        # Handle Dukascopy 'gmt time', 'timestamp', or standard 'time'/'date'
+        date_col = next((c for c in ['gmt time', 'gmt_time', 'timestamp', 'time', 'date', 'datetime'] if c in df.columns), None)
+        close_col = next((c for c in ['close', 'c', 'price'] if c in df.columns), None)
+
+        if not date_col or not close_col:
+            print(f"  [ERR] Unrecognized columns in {fname}: {list(df.columns)}")
+            return pd.Series(dtype=float)
+
+        # Parse Dukascopy timestamps
+        df[date_col] = pd.to_datetime(df[date_col], format='mixed', errors='coerce')
+        df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
+        
+        series = df[close_col].astype(float).dropna()
+        print(f"  [LOAD] {symbol}: {len(series)} bars")
+        return series
+
+    except Exception as e:
+        print(f"  [ERR] Failed to read {fname}: {e}")
         return pd.Series(dtype=float)
-
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.sort_values(date_col).set_index(date_col)
-    series = df[close_col].dropna()
-    print(f"  [LOAD] {symbol}: {len(series)} bars")
-    return series
 
 
 def align_series(s1: pd.Series, s2: pd.Series) -> tuple:
