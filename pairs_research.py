@@ -29,11 +29,11 @@ warnings.filterwarnings('ignore')
 # ─────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────
-DATA_DIR    = "."       # CSVs exported from MT5
+DATA_DIR    = "."                # Reading CSVs directly from root directory
 OUTPUT_DIR  = "pairs_artifacts"  # Results saved here
 MIN_BARS    = 2000               # Minimum history required
-MAX_HALF_LIFE = 30               # Bars — reject slow reverters
-MIN_HALF_LIFE = 2                # Bars — reject too fast (noise)
+MAX_HALF_LIFE = 30                # Bars — reject slow reverters
+MIN_HALF_LIFE = 2                 # Bars — reject too fast (noise)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -79,9 +79,19 @@ def load_price_series(symbol: str,
         print(f"  [MISS] {fname}")
         return pd.Series(dtype=float)
 
-    df = pd.read_csv(fname, parse_dates=['time'])
-    df = df.sort_values('time').set_index('time')
-    series = df['close'].dropna()
+    # Read CSV and handle flexible date column names
+    df = pd.read_csv(fname)
+    
+    date_col = next((c for c in ['time', 'Time', 'date', 'Date', '<DATE>'] if c in df.columns), None)
+    close_col = next((c for c in ['close', 'Close', '<CLOSE>'] if c in df.columns), None)
+
+    if not date_col or not close_col:
+        print(f"  [ERR] Invalid column structure in {fname}")
+        return pd.Series(dtype=float)
+
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values(date_col).set_index(date_col)
+    series = df[close_col].dropna()
     print(f"  [LOAD] {symbol}: {len(series)} bars")
     return series
 
@@ -153,7 +163,7 @@ def compute_hurst(series: pd.Series,
         for sub in sub_series:
             if len(sub) < 4:
                 continue
-            mean  = np.mean(sub)
+            mean     = np.mean(sub)
             demeaned = sub - mean
             cumdev   = np.cumsum(demeaned)
             R        = np.max(cumdev) - np.min(cumdev)
@@ -328,7 +338,6 @@ def quick_backtest(s1: pd.Series,
 
     position  = 0   # 1=long spread, -1=short spread
     pnl_list  = []
-    entry_z_val = 0.0
     entry_spread = 0.0
 
     for i in range(window + 1, len(zscore)):
@@ -431,12 +440,10 @@ def plot_pair(sym1: str, sym2: str,
     zscore.plot(ax=ax, color='darkgreen', linewidth=0.8)
     ax.axhline( 2.0, color='red',   linestyle='--',
                 linewidth=1, label='Entry ±2σ')
-    ax.axhline(-2.0, color='red',   linestyle='--',
-                linewidth=1)
+    ax.axhline(-2.0, color='red',   linestyle='--')
     ax.axhline( 3.5, color='darkred', linestyle=':',
                 linewidth=1, label='Stop ±3.5σ')
-    ax.axhline(-3.5, color='darkred', linestyle=':',
-                linewidth=1)
+    ax.axhline(-3.5, color='darkred', linestyle=':')
     ax.axhline( 0.0, color='black', linestyle='-',
                 linewidth=0.5, label='Exit 0')
     ax.set_title("Z-Score of Spread")
@@ -476,7 +483,7 @@ def run_research(timeframe: str = "H1"):
 
     # Test all combinations
     print("\n[2] Testing cointegration for all pairs...")
-    all_pairs  = list(combinations(available, 2))
+    all_pairs   = list(combinations(available, 2))
     valid_pairs = []
 
     for sym1, sym2 in all_pairs:
