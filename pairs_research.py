@@ -29,7 +29,7 @@ warnings.filterwarnings('ignore')
 # ─────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────
-DATA_DIR    = "pairs_data"       # CSVs exported from MT5
+DATA_DIR    = "."       # CSVs exported from MT5
 OUTPUT_DIR  = "pairs_artifacts"  # Results saved here
 MIN_BARS    = 2000               # Minimum history required
 MAX_HALF_LIFE = 30               # Bars — reject slow reverters
