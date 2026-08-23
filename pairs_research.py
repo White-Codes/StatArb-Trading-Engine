@@ -165,7 +165,7 @@ def test_cointegration(s1: pd.Series, s2: pd.Series, significance: float = 0.05)
     try:
         eg_stat, eg_pval, _ = coint(s1, s2)
         beta, alpha, spread = estimate_hedge_ratio(s1, s2)
-        adf_pval = adfuller(spread, maxlags=1, autolag=None)[1]
+        adf_pval = adfuller(spread, maxlag=1, autolag=None)[1]
         half_life = compute_half_life(spread)
         hurst     = compute_hurst(spread)
 
