@@ -10,6 +10,7 @@ Key changes vs v1.0:
   - Johansen test added as second cointegration method
   - Sub-period stability check
   - Works correctly with 60,000+ bar Dukascopy data
+  - Testing for shorter times over long periods are more advisable
 """
 
 import numpy as np
