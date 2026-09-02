@@ -32,7 +32,7 @@ DATA_DIR      = "."                # Reading CSVs directly from root directory
 OUTPUT_DIR    = "pairs_artifacts"  # Results saved here
 MIN_BARS      = 2000               # Minimum history required
 LOOKBACK_BARS = 10000              # Focus on recent history for cointegration
-MAX_HALF_LIFE = 60                 # Relaxed half-life ceiling (in bars)
+MAX_HALF_LIFE = 120                # Relaxed half-life ceiling (in bars)
 MIN_HALF_LIFE = 2                  # Bars — reject noise
 SIGNIFICANCE  = 0.10               # Slightly broader p-value threshold
 
@@ -164,8 +164,12 @@ def test_cointegration(s1: pd.Series, s2: pd.Series, significance: float = SIGNI
     }
 
     try:
-        eg_stat, eg_pval, _ = coint(s1, s2)
-        beta, alpha, spread = estimate_hedge_ratio(s1, s2)
+        # Use log prices for cointegration testing
+        log_s1 = np.log(s1)
+        log_s2 = np.log(s2)
+
+        eg_stat, eg_pval, _ = coint(log_s1, log_s2)
+        beta, alpha, spread = estimate_hedge_ratio(log_s1, log_s2)
         adf_pval = adfuller(spread, maxlag=1, autolag=None)[1]
         half_life = compute_half_life(spread)
         hurst     = compute_hurst(spread)
@@ -178,8 +182,11 @@ def test_cointegration(s1: pd.Series, s2: pd.Series, significance: float = SIGNI
             'spread_std': float(spread.std()),
         })
 
-        is_coint = (eg_pval < significance and adf_pval < significance and
-                    MIN_HALF_LIFE < half_life < MAX_HALF_LIFE and hurst < 0.5)
+        # Relaxed filtering tailored for hourly FX pairs
+        is_coint = (eg_pval < significance and 
+                    adf_pval < significance and
+                    MIN_HALF_LIFE < half_life < MAX_HALF_LIFE and 
+                    hurst < 0.55)
 
         result['cointegrated'] = is_coint
 
