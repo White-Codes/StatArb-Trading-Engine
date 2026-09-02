@@ -31,8 +31,10 @@ warnings.filterwarnings('ignore')
 DATA_DIR      = "."                # Reading CSVs directly from root directory
 OUTPUT_DIR    = "pairs_artifacts"  # Results saved here
 MIN_BARS      = 2000               # Minimum history required
-MAX_HALF_LIFE = 30                 # Bars — reject slow reverters
-MIN_HALF_LIFE = 2                  # Bars — reject too fast (noise)
+LOOKBACK_BARS = 10000              # Focus on recent history for cointegration
+MAX_HALF_LIFE = 60                 # Relaxed half-life ceiling (in bars)
+MIN_HALF_LIFE = 2                  # Bars — reject noise
+SIGNIFICANCE  = 0.10               # Slightly broader p-value threshold
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
