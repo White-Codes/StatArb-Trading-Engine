@@ -83,7 +83,6 @@ def load_price_series(symbol: str, timeframe: str = "H1") -> pd.Series:
         print(f"  [ERR] Failed to read {fname}: {e}")
         return pd.Series(dtype=float)
 
-
 def align_series(s1: pd.Series, s2: pd.Series) -> tuple:
     """Align two series to common timestamps."""
     combined = pd.concat([s1, s2], axis=1).dropna()
@@ -157,7 +156,7 @@ def estimate_hedge_ratio(s1: pd.Series, s2: pd.Series) -> tuple:
     return beta, alpha, spread
 
 
-def test_cointegration(s1: pd.Series, s2: pd.Series, significance: float = 0.05) -> dict:
+def test_cointegration(s1: pd.Series, s2: pd.Series, significance: float = SIGNIFICANCE) -> dict:
     result = {
         'cointegrated': False, 'pvalue': 1.0, 'hedge_ratio': 0.0,
         'alpha': 0.0, 'half_life': np.inf, 'hurst': 0.5,
@@ -285,7 +284,12 @@ def run_research(timeframe: str = "H1"):
     all_pairs, valid_pairs = list(combinations(available, 2)), []
 
     for sym1, sym2 in all_pairs:
+
         s1, s2 = align_series(price_data[sym1], price_data[sym2])
+
+        s1 = s1.tail(LOOKBACK_BARS)
+        s2 = s2.tail(LOOKBACK_BARS)
+
         if len(s1) < MIN_BARS: continue
 
         result = test_cointegration(s1, s2)
