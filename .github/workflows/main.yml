@@ -1,49 +1,40 @@
-name: StatArb Pair Research v2
+name: StatArb Full Pipeline
 
 on:
   workflow_dispatch:
-  schedule:
-    # Re-run every Monday at 00:00 UTC
-    # Cointegration changes over time
-    - cron: '0 0 * * 1'
   push:
     branches: [ main ]
-    paths:
-      - 'pairs_research.py'
-      - '*.csv'
 
 jobs:
-  run-research:
+  run-pipeline:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
         pip install numpy pandas statsmodels matplotlib
 
-    - name: Run Pairs Research v2
+    - name: Verify file versions
+      run: |
+        grep "VERSION" pairs_research.py  || true
+        grep "BT_VERSION" pairs_backtest.py || true
+
+    - name: Step 1 — Pair Research
       run: python pairs_research.py
 
-    - name: Show diagnostic report
-      run: |
-        echo "=== DIAGNOSTIC REPORT ==="
-        cat pairs_artifacts/diagnostic_report.json || true
-        echo "=== VALID PAIRS ==="
-        cat pairs_artifacts/valid_pairs.json || true
+    - name: Step 2 — Walk-Forward Backtest
+      run: python pairs_backtest.py
 
-    - name: Upload artifacts
+    - name: Upload all artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: pairs-research-results
+        name: statarb-results
         path: pairs_artifacts/
         retention-days: 30
 
@@ -55,5 +46,5 @@ jobs:
         git add pairs_artifacts/
         git diff --staged --quiet || \
           git commit -m \
-          "Auto: pairs research $(date +%Y-%m-%d)" && \
+          "Auto: full pipeline $(date +%Y-%m-%d)" && \
           git push
