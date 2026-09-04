@@ -1,0 +1,14 @@
+{
+  "n_pairs": 6,
+  "sharpe": 7.386,
+  "max_dd": -0.0119,
+  "return": 100.1202,
+  "pairs": [
+    "NZDUSD/USDCAD",
+    "EURUSD/USDCHF",
+    "EURUSD/GBPUSD",
+    "GBPUSD/USDCHF",
+    "USDCAD/USDCHF",
+    "NZDUSD/USDCHF"
+  ]
+}
