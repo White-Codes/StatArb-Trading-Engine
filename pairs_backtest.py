@@ -1,30 +1,35 @@
 """
-pairs_backtest.py  v3.0
+pairs_backtest.py  v4.0
 ========================
-CORRECTED walk-forward backtest.
+Root cause fixes vs v3.0:
 
-Bug fixed vs v2.0:
-  - Exit condition was triggering too early
-    because the z-score buffer was not being
-    maintained correctly across bars
-  - Solution: compute z-score from a fixed
-    rolling window on the spread series
-    using only bars WITHIN the current test window
-    not from the training buffer
+  FIX 1: Exit threshold set to 0.0 (exact mean cross)
+          not 0.3 which caused asymmetric exit logic
 
-Rules implemented:
-  ENTRY:  z < -2.0  →  long spread  (buy A, sell B)
-          z > +2.0  →  short spread (sell A, buy B)
-  EXIT:   z > +0.3  →  close long  (mean restored)
-          z < -0.3  →  close short (mean restored)
-  STOP:   z < -3.5  →  stop long   (loss too large)
-          z > +3.5  →  stop short  (loss too large)
+  FIX 2: SHORT spread exit corrected
+          Short entered at z=+2.0, exit when z<=0.0
+          not when z<=-0.3 which was confusing direction
 
-Expected results (realistic):
-  Trades per pair:  30-150 over full history
-  Win rate:         55-70%
-  Profit factor:    1.2-2.5
-  Avg hold:         20-80 bars
+  FIX 3: Equity model replaced
+          Instead of compounding every trade:
+          - Track cumulative PnL in spread units
+          - Convert to equity only at the end
+          - No compounding overflow
+
+  FIX 4: Minimum hold time enforced
+          Cannot exit on the same bar as entry
+          Minimum 2 bars held before exit checked
+          This prevents 1-bar micro-trades
+
+  FIX 5: Trade count sanity gate
+          If > 500 trades generated: print clear warning
+          and show sample of first 10 trades to diagnose
+
+Expected realistic results:
+  Trades:         50 to 300 per pair over full history
+  Win rate:       55% to 72%
+  Avg hold:       15 to 100 bars
+  Profit factor:  1.2 to 2.5
 """
 
 import numpy as np
@@ -37,15 +42,25 @@ from dataclasses import dataclass
 from typing      import List, Optional
 import json, os, traceback
 
-from kalman_filter  import KalmanHedgeFilter, kalman_filter_batch
-from pairs_research  import (
+from kalman_filter import KalmanHedgeFilter
+from pairs_research import (
     load_price_series, align_series,
-    estimate_hedge_ratio, compute_half_life
+    compute_half_life
 )
 
 OUTPUT_DIR = "pairs_artifacts"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-BT_VERSION = "backtest-v3.0-fixed"
+BT_VERSION = "backtest-v4.0"
+
+# ── Trading parameters ────────────────────────────────────────
+ENTRY_Z     = 2.0    # enter when |z| > this
+EXIT_Z      = 0.0    # exit when z returns past this toward 0
+STOP_Z      = 3.5    # stop loss when |z| exceeds this
+MIN_HOLD    = 2      # minimum bars before exit is checked
+DELTA       = 1e-4   # Kalman filter speed
+TRAIN_BARS  = 2016   # ~3 months H1
+TEST_BARS   = 336    # ~2 weeks H1
+STEP_BARS   = 168    # step 1 week
 
 
 # ─────────────────────────────────────────────────────────────
@@ -58,411 +73,353 @@ class Trade:
     direction    : int           # +1=long spread -1=short
     entry_spread : float
     entry_z      : float
-    entry_beta   : float
     exit_bar     : int           = 0
     exit_time    : pd.Timestamp  = None
     exit_spread  : float         = 0.0
     exit_z       : float         = 0.0
     exit_reason  : str           = ""
-    pnl_raw      : float         = 0.0   # in spread units
+    pnl_spread   : float         = 0.0
     bars_held    : int           = 0
 
 
 # ─────────────────────────────────────────────────────────────
-#  KALMAN SPREAD COMPUTATION
-#  Runs Kalman filter over a price window and returns
-#  the full spread series as a numpy array
+#  KALMAN SPREAD — runs filter once over full history
 # ─────────────────────────────────────────────────────────────
-def compute_kalman_spread(s1_vals: np.ndarray,
-                          s2_vals: np.ndarray,
-                          delta:   float = 1e-4
-                          ) -> np.ndarray:
+def build_kalman_spread(s1_vals: np.ndarray,
+                        s2_vals: np.ndarray,
+                        delta:   float = DELTA
+                        ) -> np.ndarray:
     """
-    Run Kalman filter over s1, s2 price arrays.
+    Run Kalman filter over entire price history.
     Returns spread array of same length.
 
-    The Kalman filter updates the hedge ratio β
-    every single bar, so the spread always reflects
-    the CURRENT relationship between the two prices.
-
-    This is better than OLS (fixed hedge ratio) because:
-    - OLS assumes β is constant forever
-    - Kalman allows β to slowly drift over time
-    - This matches reality — relationships shift slowly
+    The filter is CAUSAL: spread[i] uses only
+    data from bars 0..i, never future bars.
+    Safe to use in walk-forward testing.
     """
-    kf      = KalmanHedgeFilter(delta=delta)
-    spreads = np.zeros(len(s1_vals))
-
+    kf   = KalmanHedgeFilter(delta=delta)
+    out  = np.zeros(len(s1_vals))
     for i in range(len(s1_vals)):
-        beta, alpha, spread = kf.update(
-            s1_vals[i], s2_vals[i])
-        spreads[i] = spread
-
-    return spreads
+        _, _, sp = kf.update(s1_vals[i], s2_vals[i])
+        out[i]   = sp
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
-#  Z-SCORE COMPUTATION — ROLLING WINDOW
-#  This is the CORRECTED version.
-#  Key rule: z-score at bar i uses only bars
-#  from max(0, i-window) to i (rolling window).
-#  It does NOT mix training and test data.
+#  ROLLING Z-SCORE — correct implementation
 # ─────────────────────────────────────────────────────────────
-def compute_rolling_zscore(spreads: np.ndarray,
-                            window: int
-                            ) -> np.ndarray:
+def build_rolling_zscore(spreads: np.ndarray,
+                          window:  int
+                          ) -> np.ndarray:
     """
-    Compute rolling z-score for every bar.
+    z[i] = (spreads[i] - mean(spreads[i-w:i]))
+           / std(spreads[i-w:i])
 
-    z[i] = (spread[i] - mean(spread[i-w:i])) 
-           / std(spread[i-w:i])
-
-    where w = window size
-
-    The window size is set to 2 × half_life
-    which means we are normalising against
-    roughly 2 mean-reversion cycles.
-
-    Returns array of same length as spreads.
-    First 'window' bars will be 0 (insufficient data).
+    Uses ONLY past data (no look-ahead).
+    First 'window' elements are set to 0.
     """
-    n      = len(spreads)
-    z      = np.zeros(n)
-
+    n = len(spreads)
+    z = np.zeros(n)
     for i in range(window, n):
-        sub  = spreads[i - window : i]
+        sub  = spreads[i - window: i]  # past window bars
         mu   = sub.mean()
-        sig  = sub.std()
+        sig  = sub.std(ddof=1)
         if sig > 1e-12:
             z[i] = (spreads[i] - mu) / sig
-
     return z
 
 
 # ─────────────────────────────────────────────────────────────
-#  SINGLE PAIR WALK-FORWARD BACKTEST
+#  CORE BACKTEST ENGINE
 # ─────────────────────────────────────────────────────────────
-def backtest_pair(sym1: str, sym2: str,
-                  s1:   pd.Series,
-                  s2:   pd.Series,
-                  # Signal thresholds
-                  entry_z:    float = 2.0,
-                  exit_z:     float = 0.3,
-                  stop_z:     float = 3.5,
-                  # Kalman delta
-                  delta:      float = 1e-4,
-                  # Walk-forward windows (bars)
-                  train_bars: int   = 2016,
-                  test_bars:  int   = 336,
-                  step_bars:  int   = 168,
-                  # Risk
-                  max_dd_pct: float = 0.20
+def backtest_pair(sym1:        str,
+                  sym2:        str,
+                  s1:          pd.Series,
+                  s2:          pd.Series,
+                  entry_z:     float = ENTRY_Z,
+                  exit_z:      float = EXIT_Z,
+                  stop_z:      float = STOP_Z,
+                  min_hold:    int   = MIN_HOLD,
+                  delta:       float = DELTA,
+                  train_bars:  int   = TRAIN_BARS,
+                  test_bars:   int   = TEST_BARS,
+                  step_bars:   int   = STEP_BARS,
+                  max_dd_pct:  float = 0.20,
                   ) -> tuple:
     """
     Walk-forward backtest for one pair.
 
     Returns:
-      trades      : list of Trade objects
-      equity_curve: pd.Series of equity values
+      trades       : List[Trade]
+      equity_curve : pd.Series  (starts at 1.0)
+      z_series     : pd.Series  (full z-score history)
     """
-    s1_vals = s1.values.astype(float)
-    s2_vals = s2.values.astype(float)
-    times   = s1.index
-    n       = len(s1_vals)
+    s1v   = s1.values.astype(float)
+    s2v   = s2.values.astype(float)
+    times = s1.index
+    n     = len(s1v)
 
-    print(f"\n  ── {sym1} / {sym2}  ({n} bars) ──")
+    print(f"\n  ── {sym1}/{sym2}  ({n:,} bars) ──")
 
-    # ── PRE-COMPUTE full Kalman spread ────────────────────
-    # We run the Kalman filter ONCE over the full history.
-    # This is equivalent to running it bar-by-bar in live
-    # because Kalman is causal (uses only past data).
-    print(f"    Computing Kalman spread...")
-    all_spreads = compute_kalman_spread(
-        s1_vals, s2_vals, delta=delta)
+    # Step 1: Build full Kalman spread (causal)
+    print(f"    Building Kalman spread...")
+    spreads = build_kalman_spread(s1v, s2v, delta)
 
-    trades:     List[Trade] = []
-    eq_vals:    List[float] = [1.0]
-    eq_times:   List        = [times[0]]
-    equity      = 1.0
-    peak_eq     = 1.0
-    halted      = False
+    # Step 2: Walk-forward loop
+    trades:   List[Trade] = []
+    pnl_log:  List[float] = []   # raw PnL each trade
+    eq_index: List        = []
+    eq_vals:  List[float] = []
 
-    test_start  = train_bars
-    window_n    = 0
+    halted     = False
+    peak_eq    = 1.0
+    cum_pnl    = 0.0   # cumulative spread PnL
+    test_start = train_bars
+    window_n   = 0
 
     while test_start + test_bars <= n:
         window_n += 1
         test_end  = min(test_start + test_bars, n)
 
-        # ── TRAIN: determine z-score window ──────────────
-        # Use the spread from the training window
-        # to estimate the half-life and set z-window size
-        tr_spreads = all_spreads[
-            max(0, test_start - train_bars):test_start]
-        tr_series  = pd.Series(tr_spreads)
-        hl         = compute_half_life(tr_series)
-
+        # ── Calibrate z-window from training spread ───
+        tr_spread = pd.Series(
+            spreads[max(0, test_start - train_bars):
+                    test_start])
+        hl = compute_half_life(tr_spread)
         if not np.isfinite(hl) or hl <= 0:
-            hl = 30   # default fallback
-
-        # Z-score window = 2 × half_life
-        # Minimum 20 bars, maximum 200 bars
+            hl = 30
         z_window = int(np.clip(hl * 2, 20, 200))
 
         print(f"    Win {window_n}: "
               f"{times[test_start].date()} → "
               f"{times[test_end-1].date()}  "
-              f"HL={hl:.1f}  Zwin={z_window}")
+              f"HL={hl:.1f}  Zwin={z_window}",
+              end="")
 
-        # ── TEST: compute z-scores for test window ───────
-        # IMPORTANT: we compute z-score using a window
-        # that STARTS from training data.
-        # This means bar test_start's z-score uses
-        # bars [test_start - z_window : test_start]
-        # which are all training bars → no look-ahead.
+        # ── Compute z-score for this segment ─────────
+        # Include lookback so test bars have valid z
+        seg_start  = max(0, test_start - z_window)
+        seg_spread = spreads[seg_start: test_end]
+        seg_z      = build_rolling_zscore(
+            seg_spread, z_window)
 
-        # Get spread for test window + lookback
-        lookback_start = max(0,
-                             test_start - z_window)
-        segment_end    = test_end
+        # Offset: index within seg that is test_start
+        offset = test_start - seg_start
 
-        seg_spreads = all_spreads[
-            lookback_start:segment_end]
-        seg_z       = compute_rolling_zscore(
-            seg_spreads, z_window)
+        # ── Trade this window ─────────────────────────
+        position:       int            = 0
+        current_trade:  Optional[Trade] = None
+        window_trades   = 0
 
-        # Offset: position within seg that corresponds
-        # to test_start
-        offset = test_start - lookback_start
-
-        # ── BAR-BY-BAR TRADING ───────────────────────────
-        position:      int            = 0
-        current_trade: Optional[Trade] = None
-
-        for local_i in range(offset,
-                             len(seg_spreads)):
-            global_i = lookback_start + local_i
-            if global_i >= n:
+        for li in range(offset, len(seg_spread)):
+            gi = seg_start + li   # global bar index
+            if gi >= n:
                 break
 
-            spread = seg_spreads[local_i]
-            z      = seg_z[local_i]
-            t      = times[global_i]
+            sp = seg_spread[li]
+            z  = seg_z[li]
+            t  = times[gi]
 
-            # ── Drawdown check ────────────────────────
-            if equity < peak_eq * (1 - max_dd_pct):
-                if not halted:
-                    halted = True
-                    print(f"      [HALT] DD at "
-                          f"{t.date()}")
-                # Close any open trade
-                if position != 0 and current_trade:
-                    pnl = (position *
-                           (spread -
-                            current_trade.entry_spread))
-                    current_trade.exit_bar    = global_i
-                    current_trade.exit_time   = t
-                    current_trade.exit_spread = spread
-                    current_trade.exit_z      = z
-                    current_trade.exit_reason = "DD_HALT"
-                    current_trade.pnl_raw     = pnl
-                    current_trade.bars_held   = (
-                        global_i - current_trade.entry_bar)
-                    trades.append(current_trade)
-                    equity = _apply_pnl(
-                        equity,
-                        current_trade.pnl_raw,
-                        current_trade.entry_spread)
-                    peak_eq = max(peak_eq, equity)
-                    position = 0
-                    current_trade = None
+            # Drawdown check
+            # Equity approximated as 1 + cum_pnl * scale
+            approx_eq = 1.0 + cum_pnl * 10
+            if (approx_eq < peak_eq * (1 - max_dd_pct)
+                    and not halted):
+                halted = True
+                print(f"\n      [HALT] DD breached "
+                      f"at {t.date()}")
 
             if halted:
-                eq_vals.append(equity)
-                eq_times.append(t)
+                eq_index.append(t)
+                eq_vals.append(
+                    max(0.5, 1.0 + cum_pnl * 10))
                 continue
 
-            peak_eq = max(peak_eq, equity)
+            peak_eq = max(peak_eq,
+                          1.0 + cum_pnl * 10)
 
-            # ── Entry logic ───────────────────────────
+            # ── ENTRY ─────────────────────────────────
             if position == 0:
-                # Only enter on new bars with valid z
+
                 if z < -entry_z:
-                    # LONG spread: buy A, sell B
-                    # Betting spread will rise to zero
+                    # LONG spread
+                    # The spread is too LOW
+                    # We expect it to rise back to 0
+                    # Action: BUY instrument A
+                    #         SELL instrument B
                     position = 1
                     current_trade = Trade(
-                        entry_bar    = global_i,
+                        entry_bar    = gi,
                         entry_time   = t,
                         direction    = 1,
-                        entry_spread = spread,
-                        entry_z      = z,
-                        entry_beta   = 0.0)
+                        entry_spread = sp,
+                        entry_z      = z)
+                    window_trades += 1
 
                 elif z > entry_z:
-                    # SHORT spread: sell A, buy B
-                    # Betting spread will fall to zero
+                    # SHORT spread
+                    # The spread is too HIGH
+                    # We expect it to fall back to 0
+                    # Action: SELL instrument A
+                    #         BUY instrument B
                     position = -1
                     current_trade = Trade(
-                        entry_bar    = global_i,
+                        entry_bar    = gi,
                         entry_time   = t,
                         direction    = -1,
-                        entry_spread = spread,
-                        entry_z      = z,
-                        entry_beta   = 0.0)
+                        entry_spread = sp,
+                        entry_z      = z)
+                    window_trades += 1
 
-            # ── Exit logic — LONG spread ──────────────
+            # ── EXIT — LONG spread ────────────────────
             elif position == 1:
-                # We are long spread (bought A, sold B)
-                # Profit when spread rises (z increases)
-                # Exit when z returns to near zero
-                pnl = spread - current_trade.entry_spread
+                # We are long spread
+                # Entered at z ~ -2.0 (spread too low)
+                # Spread rising → z rising toward 0
+                # Exit when z crosses back above 0
 
+                bars_in = gi - current_trade.entry_bar
+                if bars_in < min_hold:
+                    # Too soon — must hold minimum bars
+                    eq_index.append(t)
+                    eq_vals.append(
+                        1.0 + cum_pnl * 10)
+                    continue
+
+                pnl    = sp - current_trade.entry_spread
                 reason = None
+
                 if z >= exit_z:
-                    # Spread returned to mean → take profit
+                    # Spread returned to mean → profit
                     reason = "MEAN_CROSS"
+
                 elif z < -stop_z:
-                    # Spread moved further against us
-                    # Cut loss — cointegration may be broken
+                    # Spread went further against us
+                    # Cointegration may be breaking
                     reason = "STOP_LOSS"
 
                 if reason:
-                    current_trade.exit_bar    = global_i
+                    current_trade.exit_bar    = gi
                     current_trade.exit_time   = t
-                    current_trade.exit_spread = spread
+                    current_trade.exit_spread = sp
                     current_trade.exit_z      = z
                     current_trade.exit_reason = reason
-                    current_trade.pnl_raw     = pnl
-                    current_trade.bars_held   = (
-                        global_i -
-                        current_trade.entry_bar)
+                    current_trade.pnl_spread  = pnl
+                    current_trade.bars_held   = bars_in
                     trades.append(current_trade)
-                    equity = _apply_pnl(
-                        equity, pnl,
-                        current_trade.entry_spread)
-                    peak_eq = max(peak_eq, equity)
+                    pnl_log.append(pnl)
+                    cum_pnl += pnl
                     position = 0
                     current_trade = None
 
-            # ── Exit logic — SHORT spread ─────────────
+            # ── EXIT — SHORT spread ───────────────────
             elif position == -1:
-                # We are short spread (sold A, bought B)
-                # Profit when spread falls (z decreases)
-                # Exit when z returns to near zero
-                pnl = (current_trade.entry_spread -
-                       spread)
+                # We are short spread
+                # Entered at z ~ +2.0 (spread too high)
+                # Spread falling → z falling toward 0
+                # Exit when z crosses back below 0
 
+                bars_in = gi - current_trade.entry_bar
+                if bars_in < min_hold:
+                    eq_index.append(t)
+                    eq_vals.append(
+                        1.0 + cum_pnl * 10)
+                    continue
+
+                # PnL for short: profit when spread falls
+                pnl    = (current_trade.entry_spread - sp)
                 reason = None
-                if z <= -exit_z:
-                    # Spread returned to mean → take profit
+
+                if z <= exit_z:
+                    # Spread returned to mean → profit
+                    # z has fallen back to 0 or below
                     reason = "MEAN_CROSS"
+
                 elif z > stop_z:
-                    # Spread moved further against us
+                    # Spread went further against us
                     reason = "STOP_LOSS"
 
                 if reason:
-                    current_trade.exit_bar    = global_i
+                    current_trade.exit_bar    = gi
                     current_trade.exit_time   = t
-                    current_trade.exit_spread = spread
+                    current_trade.exit_spread = sp
                     current_trade.exit_z      = z
                     current_trade.exit_reason = reason
-                    current_trade.pnl_raw     = pnl
-                    current_trade.bars_held   = (
-                        global_i -
-                        current_trade.entry_bar)
+                    current_trade.pnl_spread  = pnl
+                    current_trade.bars_held   = bars_in
                     trades.append(current_trade)
-                    equity = _apply_pnl(
-                        equity, pnl,
-                        current_trade.entry_spread)
-                    peak_eq = max(peak_eq, equity)
+                    pnl_log.append(pnl)
+                    cum_pnl += pnl
                     position = 0
                     current_trade = None
 
-            eq_vals.append(equity)
-            eq_times.append(t)
+            eq_index.append(t)
+            eq_vals.append(1.0 + cum_pnl * 10)
 
-        # Move to next window
+        print(f"  → {window_trades} trades")
         test_start += step_bars
 
-    # Close any trade still open at the end
+    # Close any open position at end of data
     if position != 0 and current_trade and n > 0:
-        final_i      = n - 1
-        final_spread = all_spreads[final_i]
+        gi = n - 1
+        sp = spreads[gi]
         pnl = (position *
-               (final_spread -
-                current_trade.entry_spread))
-        current_trade.exit_bar    = final_i
-        current_trade.exit_time   = times[final_i]
-        current_trade.exit_spread = final_spread
+               (sp - current_trade.entry_spread))
+        current_trade.exit_bar    = gi
+        current_trade.exit_time   = times[gi]
+        current_trade.exit_spread = sp
         current_trade.exit_z      = 0.0
-        current_trade.exit_reason = "END_OF_TEST"
-        current_trade.pnl_raw     = pnl
-        current_trade.bars_held   = (final_i -
-                                     current_trade.entry_bar)
+        current_trade.exit_reason = "END_OF_DATA"
+        current_trade.pnl_spread  = pnl
+        current_trade.bars_held   = (
+            gi - current_trade.entry_bar)
         trades.append(current_trade)
 
-    equity_curve = pd.Series(
-        eq_vals,
-        index=pd.DatetimeIndex(eq_times))
+    # Build equity curve
+    # Remove duplicate timestamps
+    eq_df = pd.Series(eq_vals,
+                      index=pd.DatetimeIndex(eq_index))
+    eq_df = eq_df[~eq_df.index.duplicated(keep='last')]
+    eq_df = eq_df.sort_index()
 
-    return trades, equity_curve
+    # Normalise so it starts at exactly 1.0
+    if len(eq_df) > 0 and eq_df.iloc[0] != 0:
+        eq_df = eq_df / eq_df.iloc[0]
 
-
-def _apply_pnl(equity: float,
-               pnl: float,
-               entry_spread: float,
-               risk: float = 0.01) -> float:
-    """
-    Convert raw spread PnL to equity change.
-
-    We normalise by the entry spread magnitude
-    so that a full mean-reversion (spread moves
-    from ±2σ back to 0) generates ~risk return.
-
-    This is a simplified model — in live trading
-    we would use actual lot sizes and pip values.
-    """
-    base = abs(entry_spread) + 1e-10
-    # Fraction of spread recovered
-    frac = pnl / base
-    # Scale to risk per trade
-    # frac=1 means full recovery → +risk return
-    eq_change = frac * risk
-    # Cap individual trade impact at ±5%
-    eq_change = float(np.clip(eq_change, -0.05, 0.05))
-    return equity * (1.0 + eq_change)
+    return trades, eq_df, pd.Series(
+        build_rolling_zscore(
+            spreads,
+            int(np.clip(30 * 2, 20, 200))),
+        index=s1.index)
 
 
 # ─────────────────────────────────────────────────────────────
 #  STATISTICS
 # ─────────────────────────────────────────────────────────────
 def compute_stats(trades: List[Trade],
-                  equity_curve: pd.Series) -> dict:
+                  equity: pd.Series) -> dict:
     if not trades:
         return {}
 
-    pnl  = np.array([t.pnl_raw for t in trades])
+    pnl  = np.array([t.pnl_spread for t in trades])
     wins = pnl[pnl > 0]
     loss = pnl[pnl < 0]
     n    = len(pnl)
-
     wr   = len(wins) / n if n > 0 else 0
     gp   = wins.sum() if len(wins) > 0 else 0
     gl   = abs(loss.sum()) if len(loss) > 0 else 1e-10
     pf   = gp / gl
 
-    ret    = equity_curve.pct_change().dropna()
-    sharpe = float(ret.mean() /
-                   (ret.std() + 1e-10) *
-                   np.sqrt(252 * 24))
+    ret    = equity.pct_change().dropna()
+    sharpe = float(
+        ret.mean() / (ret.std() + 1e-10) *
+        np.sqrt(252 * 24))  # H1 annualised
 
-    roll_max = equity_curve.cummax()
-    max_dd   = float(((equity_curve - roll_max) /
-                      roll_max).min())
+    rm     = equity.cummax()
+    max_dd = float(((equity - rm) / rm).min())
 
-    holds = [t.bars_held for t in trades]
-    exits = {}
+    holds  = [t.bars_held for t in trades]
+    exits  = {}
     for t in trades:
         exits[t.exit_reason] = (
             exits.get(t.exit_reason, 0) + 1)
@@ -473,175 +430,140 @@ def compute_stats(trades: List[Trade],
         'profit_factor': round(pf, 4),
         'sharpe'       : round(sharpe, 4),
         'max_dd'       : round(max_dd, 4),
-        'avg_bars'     : round(np.mean(holds), 1),
-        'min_bars'     : int(np.min(holds)),
-        'max_bars'     : int(np.max(holds)),
+        'avg_hold'     : round(np.mean(holds), 1),
+        'min_hold'     : int(np.min(holds)),
+        'max_hold'     : int(np.max(holds)),
         'total_pnl'    : round(float(pnl.sum()), 8),
-        'avg_win'      : round(float(wins.mean()), 8)
-                         if len(wins) > 0 else 0,
-        'avg_loss'     : round(float(loss.mean()), 8)
-                         if len(loss) > 0 else 0,
         'exit_reasons' : exits,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  SANITY CHECK ON TRADE COUNT
+#  SANITY CHECKER
 # ─────────────────────────────────────────────────────────────
-def sanity_check_trades(trades: List[Trade],
-                        sym1: str, sym2: str,
-                        n_bars: int):
+def sanity_check(trades: List[Trade],
+                 sym1:   str,
+                 sym2:   str,
+                 n_bars: int):
     """
-    Check that trade count and hold times
-    are in realistic range.
-
-    Expected for H1 pairs trading:
-      - 20 to 500 trades over full history
-      - Average hold: 15 to 200 bars
-      - Win rate: 50% to 75%
-
-    If outside these ranges → print WARNING
+    Check trade count and hold times are realistic.
+    Print first 5 trades for manual inspection.
     """
     n = len(trades)
-    trades_per_bar = n / n_bars if n_bars > 0 else 0
-
-    print(f"\n    SANITY CHECK ({sym1}/{sym2}):")
-    print(f"      Total trades:    {n}")
-    print(f"      Trades per bar:  {trades_per_bar:.4f}")
+    print(f"\n    SANITY ({sym1}/{sym2}):")
+    print(f"      Total trades:  {n}")
 
     if n == 0:
-        print(f"      ⚠ WARNING: No trades generated")
-        print(f"        Check entry_z threshold")
-    elif n > 1000:
-        print(f"      ⚠ WARNING: Too many trades ({n})")
-        print(f"        Expected 20-500 for H1 pairs trading")
-        print(f"        This suggests exit is triggering "
-              f"too early")
-        print(f"        Check exit_z and z-score computation")
-    elif n < 10:
-        print(f"      ⚠ WARNING: Very few trades ({n})")
-        print(f"        entry_z={2.0} may be too strict")
-    else:
-        print(f"      ✓ Trade count looks reasonable")
+        print(f"      ⚠ No trades — "
+              f"entry_z may be too strict")
+        return
 
-    if trades:
-        holds = [t.bars_held for t in trades]
-        avg_h = np.mean(holds)
-        if avg_h < 5:
-            print(f"      ⚠ WARNING: Avg hold = {avg_h:.1f} bars")
-            print(f"        This is too short for H1 pairs")
-            print(f"        Exit condition triggering too fast")
-        elif avg_h > 300:
-            print(f"      ⚠ WARNING: Avg hold = {avg_h:.1f} bars")
-            print(f"        This may indicate exits are too tight")
-        else:
-            print(f"      ✓ Avg hold {avg_h:.1f} bars — OK")
+    holds = [t.bars_held for t in trades]
+    print(f"      Avg hold:      {np.mean(holds):.1f} bars")
+    print(f"      Min hold:      {np.min(holds)} bars")
+    print(f"      Max hold:      {np.max(holds)} bars")
+
+    # Flags
+    if n > 500:
+        print(f"      ⚠ WARNING: {n} trades is too many")
+        print(f"        Expected 50-300 for H1 data")
+    else:
+        print(f"      ✓ Trade count OK")
+
+    if np.mean(holds) < 10:
+        print(f"      ⚠ WARNING: avg hold < 10 bars")
+        print(f"        Exits firing too fast")
+    else:
+        print(f"      ✓ Hold time OK")
+
+    # Show first 5 trades
+    print(f"\n      First 5 trades:")
+    print(f"      {'Entry':>10} {'ExitZ':>7} "
+          f"{'Hold':>5} {'PnL':>10} {'Reason'}")
+    for t in trades[:5]:
+        print(f"      {str(t.entry_time)[:10]:>10} "
+              f"{t.exit_z:>7.3f} "
+              f"{t.bars_held:>5} "
+              f"{t.pnl_spread:>10.6f} "
+              f"{t.exit_reason}")
 
 
 # ─────────────────────────────────────────────────────────────
 #  PLOT
 # ─────────────────────────────────────────────────────────────
-def plot_pair_backtest(sym1: str, sym2: str,
-                       trades: List[Trade],
-                       equity_curve: pd.Series,
-                       stats: dict,
-                       s1: pd.Series,
-                       s2: pd.Series,
-                       all_spreads: np.ndarray,
-                       z_window: int):
+def plot_results(sym1:   str,
+                 sym2:   str,
+                 trades: List[Trade],
+                 equity: pd.Series,
+                 stats:  dict):
+    if not trades or equity.empty:
+        return
+
     try:
-        fig = plt.figure(figsize=(16, 14))
-        gs  = gridspec.GridSpec(3, 2,
+        fig = plt.figure(figsize=(16, 12))
+        gs  = gridspec.GridSpec(2, 2,
                                 hspace=0.4, wspace=0.3)
 
         wr = stats.get('win_rate', 0)
         pf = stats.get('profit_factor', 0)
         sh = stats.get('sharpe', 0)
         dd = stats.get('max_dd', 0)
-        n  = stats.get('n_trades', 0)
+        nt = stats.get('n_trades', 0)
+        ah = stats.get('avg_hold', 0)
 
         fig.suptitle(
             f"{sym1}/{sym2}  "
-            f"Trades={n}  "
-            f"WR={wr:.1%}  "
-            f"PF={pf:.2f}  "
-            f"Sharpe={sh:.2f}  "
-            f"MaxDD={dd:.1%}",
-            fontsize=12)
+            f"n={nt}  WR={wr:.1%}  "
+            f"PF={pf:.2f}  Sharpe={sh:.2f}  "
+            f"MaxDD={dd:.1%}  AvgHold={ah:.0f}bars",
+            fontsize=11)
 
         # 1. Equity curve
         ax1 = fig.add_subplot(gs[0, :])
-        equity_curve.plot(ax=ax1, color='steelblue',
-                          lw=1.5)
+        equity.plot(ax=ax1, color='steelblue', lw=1.5)
         ax1.axhline(1.0, color='gray',
                     ls='--', lw=0.8)
-        ax1.set_title("Equity Curve (OOS walk-forward)")
-        ax1.set_ylabel("Equity")
+        ax1.set_title(
+            "Equity Curve (Walk-Forward OOS)")
+        ax1.set_ylabel("Equity (normalised)")
         ax1.grid(True, alpha=0.3)
 
-        # Mark wins and losses on equity curve
-        for t in trades:
+        # Mark exits on equity curve
+        for t in trades[:200]:  # cap for speed
             if t.exit_time is None:
                 continue
-            c = ('green' if t.pnl_raw > 0
+            c = ('green' if t.pnl_spread > 0
                  else 'red')
-            ax1.axvline(t.exit_time,
-                        color=c, alpha=0.15, lw=0.5)
+            try:
+                ax1.axvline(t.exit_time,
+                            color=c, alpha=0.1,
+                            lw=0.4)
+            except Exception:
+                pass
 
-        # 2. Z-score with trade markers
-        ax2 = fig.add_subplot(gs[1, :])
-        z_all = compute_rolling_zscore(
-            all_spreads, z_window)
-        z_series = pd.Series(z_all, index=s1.index)
-        z_series.iloc[-2016:].plot(
-            ax=ax2, color='darkgreen', lw=0.6,
-            alpha=0.8)
-        for level, c, ls in [
-                (entry_z,  'red',    '--'),
-                (-entry_z, 'red',    '--'),
-                (stop_z,   'darkred',':'),
-                (-stop_z,  'darkred',':'),
-                (0,        'black',  '-')]:
-            ax2.axhline(level, color=c,
-                        ls=ls, lw=0.8)
-        ax2.set_title("Z-Score (recent 3 months shown)")
+        # 2. PnL distribution
+        ax2 = fig.add_subplot(gs[1, 0])
+        pnl_vals = [t.pnl_spread for t in trades]
+        pd.Series(pnl_vals).hist(
+            ax=ax2, bins=40,
+            color='steelblue',
+            edgecolor='white', alpha=0.8)
+        ax2.axvline(0, color='red', lw=1.5)
+        ax2.set_title("PnL Distribution")
+        ax2.set_xlabel("PnL (spread units)")
         ax2.grid(True, alpha=0.3)
 
-        # Mark entries on z-score chart
-        for t in trades:
-            if t.entry_time not in z_series.index:
-                continue
-            c = 'blue' if t.direction == 1 else 'orange'
-            ax2.scatter(t.entry_time, t.entry_z,
-                        color=c, s=15, zorder=5,
-                        alpha=0.5)
-
-        # 3. PnL distribution
-        ax3 = fig.add_subplot(gs[2, 0])
-        pnl_vals = [t.pnl_raw for t in trades]
-        if pnl_vals:
-            pd.Series(pnl_vals).hist(
-                ax=ax3, bins=30,
-                color='steelblue',
-                edgecolor='white', alpha=0.8)
-        ax3.axvline(0, color='red', lw=1.5)
-        ax3.set_title("PnL Distribution (spread units)")
-        ax3.grid(True, alpha=0.3)
-
-        # 4. Hold time distribution
-        ax4 = fig.add_subplot(gs[2, 1])
+        # 3. Hold time distribution
+        ax3 = fig.add_subplot(gs[1, 1])
         holds = [t.bars_held for t in trades]
-        if holds:
-            pd.Series(holds).hist(
-                ax=ax4, bins=25,
-                color='darkorange',
-                edgecolor='white', alpha=0.8)
-        avg_h = np.mean(holds) if holds else 0
-        ax4.set_title(
-            f"Hold Period Distribution  "
-            f"avg={avg_h:.0f} bars")
-        ax4.set_xlabel("Bars held")
-        ax4.grid(True, alpha=0.3)
+        pd.Series(holds).hist(
+            ax=ax3, bins=30,
+            color='darkorange',
+            edgecolor='white', alpha=0.8)
+        ax3.set_title(
+            f"Hold Periods  avg={np.mean(holds):.0f}b")
+        ax3.set_xlabel("Bars held")
+        ax3.grid(True, alpha=0.3)
 
         plt.savefig(
             os.path.join(
@@ -653,76 +575,75 @@ def plot_pair_backtest(sym1: str, sym2: str,
 
     except Exception as e:
         print(f"    [PLOT ERR] {e}")
-        traceback.print_exc()
-
-
-# entry_z for plot — needs to be visible
-entry_z = 2.0
-stop_z  = 3.5
 
 
 # ─────────────────────────────────────────────────────────────
-#  PORTFOLIO COMBINATION
+#  PORTFOLIO PLOT — no compounding, simple average
 # ─────────────────────────────────────────────────────────────
 def plot_portfolio(results: list):
-    """
-    Combine all pair equity curves into one portfolio.
-    Equal weight.
-    """
     curves = [(r['pair'], r['equity'])
               for r in results
               if r.get('equity') is not None
-              and len(r['equity']) > 10]
+              and len(r.get('equity', [])) > 10]
 
-    if len(curves) < 2:
+    if len(curves) < 1:
         return
 
-    # Build combined DataFrame
     frames = []
     for pair, eq in curves:
-        # Remove duplicate timestamps
-        eq = eq[~eq.index.duplicated(keep='last')]
-        frames.append(eq.rename(pair))
+        # Remove duplicate index entries
+        eq_clean = eq.copy()
+        eq_clean = eq_clean[
+            ~eq_clean.index.duplicated(keep='last')]
+        eq_clean = eq_clean.sort_index()
+        frames.append(eq_clean.rename(pair))
 
-    combined = pd.concat(frames, axis=1)
-    combined = combined.ffill().fillna(1.0)
+    combined  = pd.concat(frames, axis=1)
+    combined  = combined.ffill().fillna(1.0)
     portfolio = combined.mean(axis=1)
 
+    # Normalise portfolio to start at 1.0
+    if portfolio.iloc[0] != 0:
+        portfolio = portfolio / portfolio.iloc[0]
+
     ret    = portfolio.pct_change().dropna()
-    sharpe = float(ret.mean() /
-                   (ret.std() + 1e-10) *
-                   np.sqrt(252 * 24))
+    sharpe = float(
+        ret.mean() / (ret.std() + 1e-10) *
+        np.sqrt(252 * 24))
     rm     = portfolio.cummax()
     max_dd = float(((portfolio - rm) / rm).min())
-    ret_t  = float(portfolio.iloc[-1] /
-                   portfolio.iloc[0] - 1)
+    tot_r  = float(portfolio.iloc[-1] - 1.0)
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 10))
     fig.suptitle(
         f"Portfolio: {len(curves)} pairs  "
         f"Sharpe={sharpe:.2f}  "
         f"MaxDD={max_dd:.1%}  "
-        f"Return={ret_t:.1%}",
+        f"Return={tot_r:.1%}",
         fontsize=12)
 
     combined.plot(ax=axes[0], lw=0.8, alpha=0.7)
-    axes[0].axhline(1.0, color='k', ls='--', lw=0.8)
+    axes[0].axhline(1.0, color='k',
+                    ls='--', lw=0.8)
     axes[0].set_title("Individual Pair Curves")
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
-    portfolio.plot(ax=axes[1], color='darkblue', lw=1.5)
-    axes[1].axhline(1.0, color='k', ls='--', lw=0.8)
+    portfolio.plot(ax=axes[1],
+                   color='darkblue', lw=1.5)
+    axes[1].axhline(1.0, color='k',
+                    ls='--', lw=0.8)
     axes[1].fill_between(
-        portfolio.index, portfolio.values, 1.0,
+        portfolio.index,
+        portfolio.values, 1.0,
         where=(portfolio.values >= 1.0),
-        alpha=0.3, color='green', label='Profit')
+        alpha=0.3, color='green')
     axes[1].fill_between(
-        portfolio.index, portfolio.values, 1.0,
+        portfolio.index,
+        portfolio.values, 1.0,
         where=(portfolio.values < 1.0),
-        alpha=0.3, color='red', label='Loss')
-    axes[1].set_title("Portfolio Equity")
-    axes[1].legend(fontsize=8)
+        alpha=0.3, color='red')
+    axes[1].set_title("Portfolio (equal weight)")
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -730,13 +651,23 @@ def plot_portfolio(results: list):
         os.path.join(OUTPUT_DIR, "portfolio.png"),
         dpi=120, bbox_inches='tight')
     plt.close()
-    print(f"\n  [PLOT] portfolio.png")
 
-    print(f"\n  PORTFOLIO STATS:")
-    print(f"    Pairs:      {len(curves)}")
-    print(f"    Sharpe:     {sharpe:.2f}")
-    print(f"    Max DD:     {max_dd:.1%}")
-    print(f"    Return:     {ret_t:.1%}")
+    print(f"\n  PORTFOLIO:")
+    print(f"    Pairs:   {len(curves)}")
+    print(f"    Sharpe:  {sharpe:.2f}")
+    print(f"    Max DD:  {max_dd:.1%}")
+    print(f"    Return:  {tot_r:.1%}")
+
+    with open(os.path.join(OUTPUT_DIR,
+                            "portfolio_stats.json"),
+              'w') as f:
+        json.dump({
+            'n_pairs'  : len(curves),
+            'sharpe'   : round(sharpe, 4),
+            'max_dd'   : round(max_dd, 4),
+            'return'   : round(tot_r, 4),
+            'pairs'    : [p for p, _ in curves],
+        }, f, indent=2)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -745,19 +676,23 @@ def plot_portfolio(results: list):
 def run_all_backtests(timeframe: str = "H1"):
     print(f"\n{'='*55}")
     print(f"  {BT_VERSION}")
+    print(f"  Entry: ±{ENTRY_Z}σ  "
+          f"Exit: {EXIT_Z}σ  "
+          f"Stop: ±{STOP_Z}σ  "
+          f"MinHold: {MIN_HOLD} bars")
     print(f"{'='*55}")
 
     vp_file = os.path.join(OUTPUT_DIR,
                             "valid_pairs.json")
     if not os.path.exists(vp_file):
-        print("[ERR] valid_pairs.json not found.")
-        print("      Run pairs_research.py first.")
+        print("[ERR] valid_pairs.json not found")
+        print("      Run pairs_research.py first")
         return []
 
     with open(vp_file) as f:
         valid_pairs = json.load(f)
 
-    print(f"\nFound {len(valid_pairs)} valid pairs")
+    print(f"\n  Loaded {len(valid_pairs)} valid pairs")
 
     all_results  = []
     summary_rows = []
@@ -771,93 +706,79 @@ def run_all_backtests(timeframe: str = "H1"):
 
         if len(s1) < 3000 or len(s2) < 3000:
             print(f"  [SKIP] {sym1}/{sym2}: "
-                  f"not enough data")
+                  f"insufficient data")
             continue
 
         s1a, s2a = align_series(s1, s2)
         if len(s1a) < 3000:
             print(f"  [SKIP] {sym1}/{sym2}: "
-                  f"not enough aligned bars")
+                  f"insufficient aligned bars")
             continue
 
         try:
-            trades, equity = backtest_pair(
-                sym1        = sym1,
-                sym2        = sym2,
-                s1          = s1a,
-                s2          = s2a,
-                entry_z     = 2.0,
-                exit_z      = 0.3,
-                stop_z      = 3.5,
-                delta       = 1e-4,
-                train_bars  = 2016,
-                test_bars   = 336,
-                step_bars   = 168,
-                max_dd_pct  = 0.20,
+            trades, equity, z_ser = backtest_pair(
+                sym1       = sym1,
+                sym2       = sym2,
+                s1         = s1a,
+                s2         = s2a,
+                entry_z    = ENTRY_Z,
+                exit_z     = EXIT_Z,
+                stop_z     = STOP_Z,
+                min_hold   = MIN_HOLD,
+                delta      = DELTA,
+                train_bars = TRAIN_BARS,
+                test_bars  = TEST_BARS,
+                step_bars  = STEP_BARS,
+                max_dd_pct = 0.20,
             )
         except Exception as e:
             print(f"  [ERR] {sym1}/{sym2}: {e}")
             traceback.print_exc()
             continue
 
-        # Sanity check trade count
-        sanity_check_trades(trades, sym1, sym2,
-                            len(s1a))
+        sanity_check(trades, sym1, sym2, len(s1a))
 
         if not trades:
-            print(f"  [SKIP] No trades for "
-                  f"{sym1}/{sym2}")
+            print(f"  [SKIP] No trades generated")
             continue
 
         stats = compute_stats(trades, equity)
-
-        # Pre-compute spread for plot
-        spreads = compute_kalman_spread(
-            s1a.values.astype(float),
-            s2a.values.astype(float))
-        hl = p.get('half_life', 30)
-        if not np.isfinite(hl) or hl <= 0:
-            hl = 30
-        z_win = int(np.clip(hl * 2, 20, 200))
-
-        plot_pair_backtest(
-            sym1, sym2, trades, equity, stats,
-            s1a, s2a, spreads, z_win)
+        plot_results(sym1, sym2, trades,
+                     equity, stats)
 
         # Save trade log
-        trade_rows = []
+        rows = []
         for t in trades:
-            trade_rows.append({
-                'entry_time'  : str(t.entry_time),
-                'exit_time'   : str(t.exit_time),
-                'direction'   : t.direction,
+            rows.append({
+                'entry_time' : str(t.entry_time),
+                'exit_time'  : str(t.exit_time),
+                'direction'  : t.direction,
                 'entry_spread': t.entry_spread,
-                'exit_spread' : t.exit_spread,
-                'entry_z'     : t.entry_z,
-                'exit_z'      : t.exit_z,
-                'exit_reason' : t.exit_reason,
-                'pnl_raw'     : t.pnl_raw,
-                'bars_held'   : t.bars_held,
+                'exit_spread': t.exit_spread,
+                'entry_z'    : t.entry_z,
+                'exit_z'     : t.exit_z,
+                'exit_reason': t.exit_reason,
+                'pnl_spread' : t.pnl_spread,
+                'bars_held'  : t.bars_held,
             })
-        pd.DataFrame(trade_rows).to_csv(
-            os.path.join(OUTPUT_DIR,
-                         f"trades_{sym1}_{sym2}.csv"),
+        pd.DataFrame(rows).to_csv(
+            os.path.join(
+                OUTPUT_DIR,
+                f"trades_{sym1}_{sym2}.csv"),
             index=False)
 
-        print(f"\n  ══ {sym1}/{sym2} RESULTS ══")
-        print(f"    Trades:        {stats['n_trades']}")
-        print(f"    Win Rate:      "
-              f"{stats['win_rate']:.1%}")
-        print(f"    Profit Factor: "
+        print(f"\n  ══ {sym1}/{sym2} ══")
+        print(f"    Trades:   {stats['n_trades']}")
+        print(f"    Win Rate: {stats['win_rate']:.1%}")
+        print(f"    PF:       "
               f"{stats['profit_factor']:.2f}")
-        print(f"    Sharpe:        {stats['sharpe']:.2f}")
-        print(f"    Max Drawdown:  {stats['max_dd']:.1%}")
-        print(f"    Avg Hold:      "
-              f"{stats['avg_bars']:.0f} bars  "
-              f"(min={stats['min_bars']} "
-              f"max={stats['max_bars']})")
-        print(f"    Exit reasons:  "
-              f"{stats['exit_reasons']}")
+        print(f"    Sharpe:   {stats['sharpe']:.2f}")
+        print(f"    Max DD:   {stats['max_dd']:.1%}")
+        print(f"    Avg Hold: "
+              f"{stats['avg_hold']:.0f} bars  "
+              f"(min={stats['min_hold']} "
+              f"max={stats['max_hold']})")
+        print(f"    Exits:    {stats['exit_reasons']}")
 
         all_results.append({
             'pair'  : f"{sym1}/{sym2}",
@@ -872,19 +793,19 @@ def run_all_backtests(timeframe: str = "H1"):
             'profit_factor': stats['profit_factor'],
             'sharpe'       : stats['sharpe'],
             'max_dd'       : stats['max_dd'],
-            'avg_bars_held': stats['avg_bars'],
-            'min_hold'     : stats['min_bars'],
+            'avg_hold_bars': stats['avg_hold'],
+            'min_hold'     : stats['min_hold'],
             'half_life'    : p.get('half_life', 0),
             'eg_pval'      : p.get('eg_pval', 1),
         })
 
-    # Summary
+    # Summary table
     if summary_rows:
         df_s = pd.DataFrame(summary_rows).sort_values(
             'profit_factor', ascending=False)
-        print(f"\n{'='*70}")
-        print(f"  BACKTEST SUMMARY")
-        print(f"{'='*70}")
+        print(f"\n{'='*72}")
+        print(f"  BACKTEST SUMMARY  ({BT_VERSION})")
+        print(f"{'='*72}")
         print(df_s.to_string(index=False))
         df_s.to_csv(
             os.path.join(OUTPUT_DIR,
@@ -892,7 +813,7 @@ def run_all_backtests(timeframe: str = "H1"):
             index=False)
 
     # Portfolio
-    if len(all_results) >= 2:
+    if len(all_results) >= 1:
         plot_portfolio(all_results)
 
     print(f"\n  [DONE] {BT_VERSION}")
