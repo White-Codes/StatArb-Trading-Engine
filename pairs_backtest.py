@@ -1,38 +1,38 @@
 """
-pairs_backtest.py  v5.0
+pairs_backtest.py  v6.0
 ========================
-Fixes applied:
+Root cause identified and fixed:
 
-  FIX 1: Proper walk-forward — no window overlap
-          step_bars == test_bars enforced
-          
-  FIX 2: Exit threshold raised to 0.5 (not 0.0)
-          Prevents immediate exit on noise
-          
-  FIX 3: Min hold raised to 12 bars minimum
-          (half-life based, not fixed 2 bars)
-          
-  FIX 4: Equity in pip-equivalent units
-          Spread PnL normalised by entry spread std
-          
-  FIX 5: Kalman filter re-initialised per window
-          No state leakage from future bars
-          
-  FIX 6: Z-score computed only on in-window data
-          Training stats never include test bars
-          
-  FIX 7: Duplicate equity index properly handled
-          with explicit deduplication before concat
-          
-  FIX 8: Trade count hard cap with diagnostic dump
-          if exceeded (indicates logic error)
+  THE FUNDAMENTAL BUG (all previous versions):
+  ─────────────────────────────────────────────
+  Kalman filter updates beta EVERY bar using the
+  current prices. This means spread[i] is always
+  the residual of a model fitted ON bar i.
+  
+  By construction this residual mean-reverts to zero
+  because that is what the Kalman filter minimises.
+  
+  Trading this spread is not a market strategy —
+  it is trading the fitting error of an adaptive
+  model. Win rate approaches 100% mathematically.
 
-Expected realistic results:
-  Trades:         30 to 200 per pair over full history
-  Win rate:       52% to 68%
-  Avg hold:       20 to 150 bars
-  Profit factor:  1.1 to 2.0
-  Sharpe:         0.3 to 1.5
+  THE FIX:
+  ─────────────────────────────────────────────
+  1. Estimate OLS hedge ratio on TRAINING bars only
+  2. Apply that FIXED ratio to TEST bars
+  3. The test spread is now genuinely out-of-sample
+  4. Mean reversion must come from the MARKET,
+     not from the fitting procedure
+  
+  Walk-forward: re-estimate ratio each new window
+  using training bars, test on next window only.
+
+Expected realistic results after fix:
+  Trades:       30-150 per pair
+  Win rate:     52-65%
+  PF:           1.1-1.8  
+  Sharpe:       0.3-1.2
+  Avg hold:     20-100 bars
 """
 
 import numpy as np
@@ -41,11 +41,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing      import List, Optional
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
 import json, os, traceback
 
-from kalman_filter  import KalmanHedgeFilter
 from pairs_research import (
     load_price_series, align_series,
     compute_half_life
@@ -53,25 +54,16 @@ from pairs_research import (
 
 OUTPUT_DIR = "pairs_artifacts"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-BT_VERSION = "backtest-v5.0"
+BT_VERSION = "backtest-v6.0"
 
-# ── Trading parameters ────────────────────────────────────────
-ENTRY_Z      = 2.0    # enter when |z| > this
-EXIT_Z       = 0.5    # exit when z returns to this
-                      # (FIX 2: was 0.0, too tight)
-STOP_Z       = 3.5    # stop loss
-MIN_HOLD_BARS = 12    # minimum hold (FIX 3: was 2)
-DELTA        = 1e-4   # Kalman filter speed
-
-# Walk-forward parameters
-# FIX 5: test_bars == step_bars to eliminate overlap
-TRAIN_BARS   = 2016   # ~3 months H1 for Kalman warmup
-TEST_BARS    = 336    # ~2 weeks H1
-STEP_BARS    = 336    # FIX 1: must equal TEST_BARS
-                      # (was 168 → 50% overlap bug)
-
-# Sanity gates
-MAX_TRADES_PER_PAIR = 400   # flag if exceeded
+# ── Parameters ────────────────────────────────────────────────
+ENTRY_Z       = 2.0
+EXIT_Z        = 0.5
+STOP_Z        = 3.5
+TRAIN_BARS    = 2016    # ~3 months H1: OLS estimation
+TEST_BARS     = 336     # ~2 weeks H1: OOS trading
+# step = test: zero overlap guaranteed
+MAX_TRADES    = 300     # sanity gate
 
 
 # ─────────────────────────────────────────────────────────────
@@ -79,246 +71,256 @@ MAX_TRADES_PER_PAIR = 400   # flag if exceeded
 # ─────────────────────────────────────────────────────────────
 @dataclass
 class Trade:
-    entry_bar    : int
-    entry_time   : pd.Timestamp
-    direction    : int           # +1=long spread, -1=short
-    entry_spread : float
-    entry_z      : float
-    entry_spread_std : float     # normalisation factor
-    exit_bar     : int           = 0
-    exit_time    : pd.Timestamp  = None
-    exit_spread  : float         = 0.0
-    exit_z       : float         = 0.0
-    exit_reason  : str           = ""
-    pnl_spread   : float         = 0.0   # raw spread units
-    pnl_norm     : float         = 0.0   # normalised by std
-    bars_held    : int           = 0
+    entry_bar     : int
+    entry_time    : pd.Timestamp
+    direction     : int        # +1 long spread, -1 short
+    entry_spread  : float
+    entry_z       : float
+    spread_std    : float      # training spread std
+    exit_bar      : int           = 0
+    exit_time     : pd.Timestamp  = None
+    exit_spread   : float         = 0.0
+    exit_z        : float         = 0.0
+    exit_reason   : str           = ""
+    pnl_raw       : float         = 0.0
+    pnl_norm      : float         = 0.0  # pnl / spread_std
+    bars_held     : int           = 0
 
 
 # ─────────────────────────────────────────────────────────────
-#  KALMAN SPREAD — per-window, no future leak
+#  OLS HEDGE RATIO — training only
 # ─────────────────────────────────────────────────────────────
-def build_kalman_spread_window(
-        s1_vals: np.ndarray,
-        s2_vals: np.ndarray,
-        warmup:  int,
-        delta:   float = DELTA
-        ) -> np.ndarray:
+def estimate_ols(s1_train: np.ndarray,
+                 s2_train: np.ndarray
+                 ) -> tuple[float, float, float]:
     """
-    Run fresh Kalman filter from scratch.
-    First 'warmup' bars are training only.
-    Returns spread for ALL bars (train + test).
+    Fit OLS on log prices using training bars.
     
-    Key: filter is NEVER carried across windows.
-    Each window gets a fresh KalmanHedgeFilter().
-    This ensures no state leakage from future data.
-    """
-    kf  = KalmanHedgeFilter(delta=delta)
-    out = np.zeros(len(s1_vals))
-    for i in range(len(s1_vals)):
-        _, _, sp = kf.update(s1_vals[i], s2_vals[i])
-        out[i]   = sp
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
-#  ROLLING Z-SCORE — strict no look-ahead
-# ─────────────────────────────────────────────────────────────
-def rolling_zscore_strict(
-        spreads: np.ndarray,
-        window:  int
-        ) -> np.ndarray:
-    """
-    z[i] uses ONLY spreads[i-window : i].
-    spreads[i] itself is NOT included in mean/std.
+    Returns: (beta, alpha, spread_std)
     
-    This is strictly causal:
-    - mean and std are computed on PAST bars only
-    - the current bar's spread is then standardised
+    beta and alpha are FIXED for the test window.
+    spread_std is used to normalise PnL.
+    """
+    log1 = np.log(s1_train)
+    log2 = np.log(s2_train)
+
+    x = add_constant(log2)
+    m = OLS(log1, x).fit()
+
+    alpha = float(m.params.iloc[0])
+    beta  = float(m.params.iloc[1])
+
+    # In-sample spread std for normalisation
+    spread_train = log1 - beta * log2 - alpha
+    std          = float(np.std(spread_train, ddof=1))
+    if std < 1e-10:
+        std = 1.0
+
+    return beta, alpha, std
+
+
+# ─────────────────────────────────────────────────────────────
+#  APPLY FIXED RATIO TO TEST BARS
+# ─────────────────────────────────────────────────────────────
+def apply_fixed_spread(s1_test: np.ndarray,
+                       s2_test: np.ndarray,
+                       beta:    float,
+                       alpha:   float
+                       ) -> np.ndarray:
+    """
+    Apply training-estimated beta/alpha to test prices.
     
-    First 'window' elements → z = 0 (insufficient history).
+    spread[i] = log(s1[i]) - beta*log(s2[i]) - alpha
+    
+    This spread is genuinely OOS — the model parameters
+    were fixed before seeing any test bar.
     """
-    n = len(spreads)
-    z = np.zeros(n)
-    for i in range(window, n):
-        # Past window: [i-window, i)  — excludes bar i
-        past = spreads[i - window: i]
-        mu   = past.mean()
-        sig  = past.std(ddof=1)
-        if sig > 1e-12:
-            z[i] = (spreads[i] - mu) / sig
-    return z
+    log1 = np.log(s1_test)
+    log2 = np.log(s2_test)
+    return log1 - beta * log2 - alpha
 
 
 # ─────────────────────────────────────────────────────────────
-#  CORE BACKTEST ENGINE  v5.0
+#  Z-SCORE — uses training stats (fixed mean/std)
 # ─────────────────────────────────────────────────────────────
-def backtest_pair(
-        sym1:       str,
-        sym2:       str,
-        s1:         pd.Series,
-        s2:         pd.Series,
-        entry_z:    float = ENTRY_Z,
-        exit_z:     float = EXIT_Z,
-        stop_z:     float = STOP_Z,
-        min_hold:   int   = MIN_HOLD_BARS,
-        delta:      float = DELTA,
-        train_bars: int   = TRAIN_BARS,
-        test_bars:  int   = TEST_BARS,
-        step_bars:  int   = STEP_BARS,
-        ) -> tuple:
+def compute_test_zscore(test_spread:   np.ndarray,
+                        train_spread:  np.ndarray,
+                        ) -> np.ndarray:
     """
-    Walk-forward backtest — no window overlap.
-
-    Architecture per window:
-      1. Take train_bars as Kalman warmup
-      2. Run fresh Kalman on train+test combined
-      3. Compute z-score using only past bars within window
-      4. Trade only on test bars
-      5. Advance by step_bars (= test_bars, no overlap)
-
-    Returns:
-      trades       : List[Trade]
-      equity_curve : pd.Series  (cumulative normalised PnL)
-      diagnostics  : dict
+    Standardise test spread using TRAINING mean and std.
+    
+    z[i] = (test_spread[i] - train_mean) / train_std
+    
+    Why training stats:
+    - Using rolling test stats still leaks information
+      because future test bars shift the rolling window
+    - Training mean/std are fixed before test starts
+    - This is the correct OOS z-score
+    
+    Note: if the cointegration relationship is stable,
+    the test spread should have mean ~0 and std ~1
+    relative to training stats.
     """
-    # Enforce no overlap
-    if step_bars != test_bars:
-        print(f"    [WARN] step_bars({step_bars}) != "
-              f"test_bars({test_bars}), forcing equal")
-        step_bars = test_bars
+    mu  = float(np.mean(train_spread))
+    sig = float(np.std(train_spread, ddof=1))
+    if sig < 1e-10:
+        sig = 1.0
+    return (test_spread - mu) / sig
 
+
+# ─────────────────────────────────────────────────────────────
+#  CORE ENGINE  v6.0
+# ─────────────────────────────────────────────────────────────
+def backtest_pair(sym1:       str,
+                  sym2:       str,
+                  s1:         pd.Series,
+                  s2:         pd.Series,
+                  entry_z:    float = ENTRY_Z,
+                  exit_z:     float = EXIT_Z,
+                  stop_z:     float = STOP_Z,
+                  train_bars: int   = TRAIN_BARS,
+                  test_bars:  int   = TEST_BARS,
+                  ) -> tuple:
+    """
+    Walk-forward backtest with FIXED OLS hedge ratio.
+    
+    Per window:
+      1. Fit OLS on s1[train_start:train_end]
+         → fixed beta, alpha
+      2. Compute training spread → get mean, std
+      3. Apply fixed ratio to s1[test_start:test_end]
+         → OOS spread (no future info)
+      4. Z-score using training mean/std (no future info)
+      5. Trade on z-score signals
+      6. Advance: train_start += test_bars (no overlap)
+    
+    Returns: trades, equity_curve, diagnostics
+    """
     s1v   = s1.values.astype(float)
     s2v   = s2.values.astype(float)
     times = s1.index
     n     = len(s1v)
 
     print(f"\n  ── {sym1}/{sym2}  ({n:,} bars) ──")
-    print(f"    Train={train_bars}  "
-          f"Test={test_bars}  "
-          f"Step={step_bars}")
+    print(f"    Train={train_bars}  Test={test_bars}  "
+          f"(step=test, zero overlap)")
 
     trades:     List[Trade] = []
-    # Equity tracking: list of (timestamp, cumulative_norm_pnl)
-    eq_records: List[tuple] = []
-    cum_norm_pnl = 0.0
+    eq_times:   List        = []
+    eq_vals:    List[float] = []
+    cum_pnl_n   = 0.0   # cumulative normalised PnL
 
     window_n   = 0
-    win_start  = 0   # start of train window
+    train_start = 0
 
-    while win_start + train_bars + test_bars <= n:
-        window_n  += 1
-        train_end  = win_start + train_bars
-        test_end   = min(train_end + test_bars, n)
-        seg_end    = test_end
+    while train_start + train_bars + test_bars <= n:
+        window_n   += 1
+        train_end   = train_start + train_bars
+        test_end    = min(train_end + test_bars, n)
+        test_len    = test_end - train_end
 
-        # ── Fresh Kalman on train+test ────────────────
-        seg_s1 = s1v[win_start: seg_end]
-        seg_s2 = s2v[win_start: seg_end]
-        seg_sp = build_kalman_spread_window(
-            seg_s1, seg_s2,
-            warmup=train_bars,
-            delta=delta)
+        if test_len < 20:
+            train_start += test_bars
+            continue
 
-        # ── Half-life from training spread only ──────
-        train_sp = pd.Series(seg_sp[:train_bars])
-        hl = compute_half_life(train_sp)
-        if not np.isfinite(hl) or hl <= 1:
+        # ── Step 1: OLS on training bars ─────────────
+        try:
+            beta, alpha, train_std = estimate_ols(
+                s1v[train_start: train_end],
+                s2v[train_start: train_end])
+        except Exception as e:
+            print(f"    Win {window_n}: OLS failed: {e}")
+            train_start += test_bars
+            continue
+
+        # ── Step 2: Training spread stats ────────────
+        log1_tr = np.log(s1v[train_start: train_end])
+        log2_tr = np.log(s2v[train_start: train_end])
+        train_sp = log1_tr - beta * log2_tr - alpha
+        # Half-life from training (for info only)
+        hl = compute_half_life(
+            pd.Series(train_sp))
+        if not np.isfinite(hl) or hl <= 0:
             hl = 30.0
-        hl = float(np.clip(hl, 5.0, 150.0))
+        hl = float(np.clip(hl, 2.0, 200.0))
 
-        # Z-window: 2× half-life, clamped
-        z_window = int(np.clip(hl * 2, 30, 300))
+        # ── Step 3: OOS test spread ───────────────────
+        test_sp = apply_fixed_spread(
+            s1v[train_end: test_end],
+            s2v[train_end: test_end],
+            beta, alpha)
 
-        # ── Training spread std for normalisation ────
-        # Use last z_window bars of training spread
-        # This is the "expected" spread volatility
-        train_tail = seg_sp[
-            max(0, train_bars - z_window): train_bars]
-        spread_std = float(np.std(train_tail, ddof=1))
-        if spread_std < 1e-10:
-            spread_std = 1.0
-
-        # ── Z-score over entire segment ──────────────
-        # Strictly causal: z[i] uses spreads[i-w:i]
-        seg_z = rolling_zscore_strict(seg_sp, z_window)
-
-        test_start_offset = train_bars  # within seg
+        # ── Step 4: Z-score using training stats ─────
+        test_z = compute_test_zscore(
+            test_sp, train_sp)
 
         t_start = times[train_end]
         t_end   = times[test_end - 1]
         print(f"    Win {window_n}: "
               f"{t_start.date()} → {t_end.date()}  "
-              f"HL={hl:.1f}  Zwin={z_window}  "
-              f"SpreadStd={spread_std:.6f}",
+              f"β={beta:.4f}  "
+              f"HL={hl:.1f}  "
+              f"TrainStd={train_std:.6f}",
               end="")
 
-        # ── Trade the test window ─────────────────────
-        position      : int            = 0
-        current_trade : Optional[Trade] = None
-        window_trades = 0
+        # ── Step 5: Trade ─────────────────────────────
+        position:      int             = 0
+        current_trade: Optional[Trade] = None
+        window_trades  = 0
 
-        for li in range(test_start_offset,
-                        seg_end - win_start):
-            gi = win_start + li   # global bar index
-            if gi >= n:
-                break
+        # Min hold: half-life based, at least 6 bars
+        min_hold = int(np.clip(hl / 2, 6, 60))
 
-            sp = seg_sp[li]
-            z  = seg_z[li]
+        for li in range(test_len):
+            gi = train_end + li
+            sp = test_sp[li]
+            z  = test_z[li]
             t  = times[gi]
 
-            # Skip bars with no valid z-score
-            if z == 0.0 and li < z_window + test_start_offset:
-                continue
-
-            # ── ENTRY ─────────────────────────────────
+            # ── Entry ─────────────────────────────────
             if position == 0:
                 if z < -entry_z:
-                    position = 1
+                    position      = 1
                     current_trade = Trade(
-                        entry_bar        = gi,
-                        entry_time       = t,
-                        direction        = 1,
-                        entry_spread     = sp,
-                        entry_z          = z,
-                        entry_spread_std = spread_std)
+                        entry_bar    = gi,
+                        entry_time   = t,
+                        direction    = 1,
+                        entry_spread = sp,
+                        entry_z      = z,
+                        spread_std   = train_std)
                     window_trades += 1
 
                 elif z > entry_z:
-                    position = -1
+                    position      = -1
                     current_trade = Trade(
-                        entry_bar        = gi,
-                        entry_time       = t,
-                        direction        = -1,
-                        entry_spread     = sp,
-                        entry_z          = z,
-                        entry_spread_std = spread_std)
+                        entry_bar    = gi,
+                        entry_time   = t,
+                        direction    = -1,
+                        entry_spread = sp,
+                        entry_z      = z,
+                        spread_std   = train_std)
                     window_trades += 1
 
-            # ── EXIT — LONG ───────────────────────────
+            # ── Exit: Long ────────────────────────────
             elif position == 1:
                 bars_in = gi - current_trade.entry_bar
+                pnl_raw = sp - current_trade.entry_spread
+                pnl_n   = pnl_raw / train_std
 
                 if bars_in < min_hold:
-                    # Record equity without exit check
-                    norm_pnl = (
-                        (sp - current_trade.entry_spread)
-                        / current_trade.entry_spread_std)
-                    eq_records.append(
-                        (t, cum_norm_pnl + norm_pnl))
+                    # Enforce hold, track unrealised
+                    eq_times.append(t)
+                    eq_vals.append(
+                        cum_pnl_n + pnl_n)
                     continue
 
-                # Unrealised PnL
-                pnl_raw  = sp - current_trade.entry_spread
-                pnl_norm = pnl_raw / current_trade.entry_spread_std
-                reason   = None
-
-                # FIX 2: Exit at EXIT_Z=0.5, not 0.0
+                reason = None
                 if z >= exit_z:
                     reason = "MEAN_CROSS"
                 elif z < -stop_z:
                     reason = "STOP_LOSS"
+                elif li == test_len - 1:
+                    reason = "END_OF_WINDOW"
 
                 if reason:
                     current_trade.exit_bar    = gi
@@ -326,41 +328,37 @@ def backtest_pair(
                     current_trade.exit_spread = sp
                     current_trade.exit_z      = z
                     current_trade.exit_reason = reason
-                    current_trade.pnl_spread  = pnl_raw
-                    current_trade.pnl_norm    = pnl_norm
+                    current_trade.pnl_raw     = pnl_raw
+                    current_trade.pnl_norm    = pnl_n
                     current_trade.bars_held   = bars_in
                     trades.append(current_trade)
-                    cum_norm_pnl += pnl_norm
-                    position      = 0
+                    cum_pnl_n  += pnl_n
+                    position    = 0
                     current_trade = None
-
                 else:
-                    # Still in trade — record unrealised
-                    eq_records.append(
-                        (t, cum_norm_pnl + pnl_norm))
+                    # Still in trade
+                    eq_times.append(t)
+                    eq_vals.append(cum_pnl_n + pnl_n)
                     continue
 
-            # ── EXIT — SHORT ──────────────────────────
+            # ── Exit: Short ───────────────────────────
             elif position == -1:
                 bars_in = gi - current_trade.entry_bar
+                pnl_raw = current_trade.entry_spread - sp
+                pnl_n   = pnl_raw / train_std
 
                 if bars_in < min_hold:
-                    norm_pnl = (
-                        (current_trade.entry_spread - sp)
-                        / current_trade.entry_spread_std)
-                    eq_records.append(
-                        (t, cum_norm_pnl + norm_pnl))
+                    eq_times.append(t)
+                    eq_vals.append(cum_pnl_n + pnl_n)
                     continue
 
-                pnl_raw  = current_trade.entry_spread - sp
-                pnl_norm = pnl_raw / current_trade.entry_spread_std
-                reason   = None
-
-                # FIX 2: Exit at EXIT_Z=0.5 (symmetric)
+                reason = None
                 if z <= exit_z:
                     reason = "MEAN_CROSS"
                 elif z > stop_z:
                     reason = "STOP_LOSS"
+                elif li == test_len - 1:
+                    reason = "END_OF_WINDOW"
 
                 if reason:
                     current_trade.exit_bar    = gi
@@ -368,75 +366,44 @@ def backtest_pair(
                     current_trade.exit_spread = sp
                     current_trade.exit_z      = z
                     current_trade.exit_reason = reason
-                    current_trade.pnl_spread  = pnl_raw
-                    current_trade.pnl_norm    = pnl_norm
+                    current_trade.pnl_raw     = pnl_raw
+                    current_trade.pnl_norm    = pnl_n
                     current_trade.bars_held   = bars_in
                     trades.append(current_trade)
-                    cum_norm_pnl += pnl_norm
-                    position      = 0
+                    cum_pnl_n  += pnl_n
+                    position    = 0
                     current_trade = None
-
                 else:
-                    eq_records.append(
-                        (t, cum_norm_pnl + pnl_norm))
+                    eq_times.append(t)
+                    eq_vals.append(cum_pnl_n + pnl_n)
                     continue
 
-            # Realised equity point
-            eq_records.append((t, cum_norm_pnl))
+            # Realised point
+            eq_times.append(t)
+            eq_vals.append(cum_pnl_n)
 
         print(f"  → {window_trades} trades")
+        # FIX: step by test_bars only (zero overlap)
+        train_start += test_bars
 
-        # FIX 1: No overlap — advance by test_bars
-        win_start += step_bars
-
-    # ── Close any open position at end ───────────────
-    if (position != 0 and current_trade is not None
-            and n > 0):
-        gi  = n - 1
-        sp  = s1v[gi] - s2v[gi]   # approximate
-        pnl_raw = (position *
-                   (sp - current_trade.entry_spread))
-        pnl_norm = pnl_raw / current_trade.entry_spread_std
-        current_trade.exit_bar    = gi
-        current_trade.exit_time   = times[gi]
-        current_trade.exit_spread = sp
-        current_trade.exit_z      = 0.0
-        current_trade.exit_reason = "END_OF_DATA"
-        current_trade.pnl_spread  = pnl_raw
-        current_trade.pnl_norm    = pnl_norm
-        current_trade.bars_held   = gi - current_trade.entry_bar
-        trades.append(current_trade)
-
-    # ── Build equity curve ────────────────────────────
-    if eq_records:
-        eq_idx  = [r[0] for r in eq_records]
-        eq_vals = [r[1] for r in eq_records]
-        equity  = pd.Series(eq_vals,
-                            index=pd.DatetimeIndex(eq_idx))
-        # Deduplicate timestamps
-        equity  = equity[~equity.index.duplicated(
-                            keep='last')]
-        equity  = equity.sort_index()
-
-        # Convert cumulative normalised PnL
-        # to equity starting at 1.0
-        # Scale: 1 spread-std unit = 5% of equity
-        # (conservative, adjust to taste)
-        scale  = 0.05
+    # ── Equity curve ──────────────────────────────────
+    if eq_times:
+        equity = pd.Series(
+            eq_vals,
+            index=pd.DatetimeIndex(eq_times))
+        equity = equity[
+            ~equity.index.duplicated(keep='last')]
+        equity = equity.sort_index()
+        # Convert normalised PnL to equity
+        # 1 train_std unit = 3% equity move
+        scale  = 0.03
         equity = 1.0 + equity * scale
-
-        # Floor at 0 (can't lose more than you have)
-        equity = equity.clip(lower=0.0)
+        equity = equity.clip(lower=0.01)
     else:
-        equity = pd.Series([1.0], index=[s1.index[0]])
+        equity = pd.Series(
+            [1.0], index=[s1.index[0]])
 
-    diag = {
-        'n_windows'  : window_n,
-        'n_trades'   : len(trades),
-        'cum_norm_pnl': cum_norm_pnl,
-    }
-
-    return trades, equity, diag
+    return trades, equity, {'n_windows': window_n}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -451,19 +418,16 @@ def compute_stats(trades: List[Trade],
     wins = pnl[pnl > 0]
     loss = pnl[pnl < 0]
     n    = len(pnl)
-    wr   = len(wins) / n if n > 0 else 0
-    gp   = wins.sum() if len(wins) > 0 else 0.0
-    gl   = abs(loss.sum()) if len(loss) > 0 else 1e-10
-    pf   = gp / gl
+
+    gp  = wins.sum() if len(wins) > 0 else 0.0
+    gl  = abs(loss.sum()) if len(loss) > 0 else 1e-10
 
     ret    = equity.pct_change().dropna()
     sharpe = float(
         ret.mean() / (ret.std() + 1e-10) *
         np.sqrt(252 * 24))
-
     rm     = equity.cummax()
     max_dd = float(((equity - rm) / rm).min())
-
     holds  = [t.bars_held for t in trades]
     exits  = {}
     for t in trades:
@@ -472,110 +436,84 @@ def compute_stats(trades: List[Trade],
 
     return {
         'n_trades'     : n,
-        'win_rate'     : round(wr, 4),
-        'profit_factor': round(pf, 4),
+        'win_rate'     : round(len(wins)/n, 4),
+        'profit_factor': round(gp/gl, 4),
         'sharpe'       : round(sharpe, 4),
         'max_dd'       : round(max_dd, 4),
         'avg_hold'     : round(float(np.mean(holds)), 1),
         'min_hold'     : int(np.min(holds)),
         'max_hold'     : int(np.max(holds)),
-        'total_pnl_norm': round(float(pnl.sum()), 4),
+        'total_pnl_n'  : round(float(pnl.sum()), 4),
         'exit_reasons' : exits,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  SANITY CHECKER
+#  SANITY CHECKER — hard gates with clear diagnostics
 # ─────────────────────────────────────────────────────────────
-def sanity_check(trades:  List[Trade],
-                 sym1:    str,
-                 sym2:    str,
-                 n_bars:  int,
-                 stats:   dict):
-    n     = len(trades)
-    holds = [t.bars_held for t in trades] if trades else [0]
+def sanity_check(trades: List[Trade],
+                 sym1:   str,
+                 sym2:   str,
+                 stats:  dict) -> bool:
+    n   = len(trades)
+    wr  = stats.get('win_rate', 0)
+    pf  = stats.get('profit_factor', 0)
+    ah  = stats.get('avg_hold', 0)
+    mh  = stats.get('min_hold', 0)
 
     print(f"\n    ── SANITY: {sym1}/{sym2} ──")
-    print(f"      Bars in dataset : {n_bars:,}")
-    print(f"      Total trades    : {n}")
+    print(f"      Trades      : {n}")
+    print(f"      Win rate    : {wr:.1%}")
+    print(f"      PF          : {pf:.2f}")
+    print(f"      Avg hold    : {ah:.1f} bars")
+    print(f"      Min hold    : {mh} bars")
 
-    if n == 0:
-        print(f"      ⚠ No trades generated")
-        print(f"        Possible causes:")
-        print(f"        - entry_z too strict")
-        print(f"        - insufficient data after warmup")
-        return
+    failures = []
 
-    avg_h = np.mean(holds)
-    min_h = np.min(holds)
+    if n > MAX_TRADES:
+        failures.append(
+            f"Trade count {n} > {MAX_TRADES}: "
+            f"exit logic still too aggressive")
 
-    print(f"      Avg hold        : {avg_h:.1f} bars")
-    print(f"      Min hold        : {min_h} bars")
-    print(f"      Win rate        : "
-          f"{stats.get('win_rate',0):.1%}")
-    print(f"      Profit factor   : "
-          f"{stats.get('profit_factor',0):.2f}")
+    if wr > 0.75:
+        failures.append(
+            f"Win rate {wr:.1%} > 75%: "
+            f"look-ahead bias likely present")
 
-    ok = True
+    if pf > 4.0:
+        failures.append(
+            f"Profit factor {pf:.2f} > 4.0: "
+            f"unrealistic")
 
-    # Gate 1: trade count
-    if n > MAX_TRADES_PER_PAIR:
-        print(f"      ✗ FAIL: {n} trades > "
-              f"{MAX_TRADES_PER_PAIR} maximum")
-        print(f"        Indicates exit logic bug")
-        ok = False
-    elif n < 10:
-        print(f"      ⚠ WARN: only {n} trades "
-              f"(low statistical power)")
+    if ah < 20 and n > 10:
+        failures.append(
+            f"Avg hold {ah:.1f} < 20 bars: "
+            f"exits still too fast")
+
+    if failures:
+        print(f"      ✗ SANITY FAILURES:")
+        for f in failures:
+            print(f"        - {f}")
+        return False
     else:
-        print(f"      ✓ Trade count: {n}")
+        print(f"      ✓ All checks passed")
 
-    # Gate 2: hold time
-    if avg_h < 15:
-        print(f"      ✗ FAIL: avg hold {avg_h:.1f} < 15 bars")
-        print(f"        Exits firing too fast")
-        ok = False
-    else:
-        print(f"      ✓ Avg hold: {avg_h:.1f} bars")
-
-    # Gate 3: win rate
-    wr = stats.get('win_rate', 0)
-    if wr > 0.80:
-        print(f"      ✗ FAIL: win rate {wr:.1%} > 80%")
-        print(f"        Indicates look-ahead bias")
-        ok = False
-    elif wr > 0.70:
-        print(f"      ⚠ WARN: win rate {wr:.1%} is high")
-    else:
-        print(f"      ✓ Win rate: {wr:.1%}")
-
-    # Gate 4: profit factor
-    pf = stats.get('profit_factor', 0)
-    if pf > 5.0:
-        print(f"      ✗ FAIL: PF={pf:.2f} > 5.0")
-        print(f"        Unrealistic for real trading")
-        ok = False
-    else:
-        print(f"      ✓ Profit factor: {pf:.2f}")
-
-    if ok:
-        print(f"      ✓ ALL SANITY CHECKS PASSED")
-
-    # Show first 8 trades for manual inspection
-    print(f"\n      First 8 trades:")
-    print(f"      {'Entry':>10} {'Dir':>4} "
-          f"{'EntZ':>6} {'ExitZ':>6} "
-          f"{'Hold':>5} {'PnL_n':>8} {'Reason'}")
-    for t in trades[:8]:
-        d = '+' if t.direction == 1 else '-'
+    # Sample trades
+    print(f"\n      Sample trades (first 6):")
+    print(f"      {'Date':>10} {'Dir':>4} "
+          f"{'EnZ':>6} {'ExZ':>6} "
+          f"{'Hold':>5} {'PnL_n':>7} Reason")
+    for t in trades[:6]:
+        d = '+L' if t.direction == 1 else '-S'
         print(f"      "
-              f"{str(t.entry_time)[:10]:>10} "
-              f"[{d}] "
+              f"{str(t.entry_time)[:10]} "
+              f"{d} "
               f"{t.entry_z:>6.2f} "
               f"{t.exit_z:>6.2f} "
               f"{t.bars_held:>5} "
-              f"{t.pnl_norm:>8.4f} "
+              f"{t.pnl_norm:>7.4f} "
               f"{t.exit_reason}")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -589,78 +527,70 @@ def plot_results(sym1:   str,
     if not trades or equity.empty:
         return
     try:
-        fig = plt.figure(figsize=(16, 12))
+        fig = plt.figure(figsize=(16, 10))
         gs  = gridspec.GridSpec(
             2, 2, hspace=0.4, wspace=0.3)
 
-        wr  = stats.get('win_rate', 0)
-        pf  = stats.get('profit_factor', 0)
-        sh  = stats.get('sharpe', 0)
-        dd  = stats.get('max_dd', 0)
-        nt  = stats.get('n_trades', 0)
-        ah  = stats.get('avg_hold', 0)
-
         fig.suptitle(
-            f"{sym1}/{sym2}  n={nt}  "
-            f"WR={wr:.1%}  PF={pf:.2f}  "
-            f"Sharpe={sh:.2f}  MaxDD={dd:.1%}  "
-            f"AvgHold={ah:.0f}b",
-            fontsize=11)
+            f"{sym1}/{sym2}  "
+            f"n={stats['n_trades']}  "
+            f"WR={stats['win_rate']:.1%}  "
+            f"PF={stats['profit_factor']:.2f}  "
+            f"Sharpe={stats['sharpe']:.2f}  "
+            f"MaxDD={stats['max_dd']:.1%}  "
+            f"AvgHold={stats['avg_hold']:.0f}b",
+            fontsize=10)
 
-        # Equity
         ax1 = fig.add_subplot(gs[0, :])
-        equity.plot(ax=ax1,
-                    color='steelblue', lw=1.5)
+        equity.plot(ax=ax1, color='steelblue', lw=1.5)
         ax1.axhline(1.0, color='gray',
                     ls='--', lw=0.8)
         ax1.set_title(
-            "Equity Curve (Walk-Forward OOS, "
-            "no window overlap)")
-        ax1.set_ylabel("Equity (normalised, 1=start)")
+            "Equity — OOS only, fixed OLS hedge ratio, "
+            "zero window overlap")
+        ax1.set_ylabel("Equity (1 = start)")
         ax1.grid(True, alpha=0.3)
 
-        for t in trades[:300]:
-            if t.exit_time is None: continue
-            c = 'green' if t.pnl_norm > 0 else 'red'
+        for t in trades[:200]:
+            if t.exit_time is None:
+                continue
+            c = ('green' if t.pnl_norm > 0
+                 else 'red')
             try:
-                ax1.axvline(t.exit_time,
-                            color=c,
-                            alpha=0.08, lw=0.5)
+                ax1.axvline(
+                    t.exit_time, color=c,
+                    alpha=0.08, lw=0.5)
             except Exception:
                 pass
 
-        # PnL distribution (normalised)
         ax2 = fig.add_subplot(gs[1, 0])
-        pnl_n = [t.pnl_norm for t in trades]
-        pd.Series(pnl_n).hist(
-            ax=ax2, bins=40,
-            color='steelblue',
-            edgecolor='white', alpha=0.8)
+        pd.Series([t.pnl_norm for t in trades]
+                  ).hist(ax=ax2, bins=40,
+                         color='steelblue',
+                         edgecolor='white',
+                         alpha=0.8)
         ax2.axvline(0, color='red', lw=1.5)
-        ax2.set_title(
-            "PnL Distribution (spread-std normalised)")
-        ax2.set_xlabel("PnL (σ units)")
+        ax2.set_title("PnL (σ-normalised)")
         ax2.grid(True, alpha=0.3)
 
-        # Hold time
         ax3 = fig.add_subplot(gs[1, 1])
-        holds = [t.bars_held for t in trades]
-        pd.Series(holds).hist(
-            ax=ax3, bins=30,
-            color='darkorange',
-            edgecolor='white', alpha=0.8)
-        ax3.set_title(
-            f"Hold Periods  avg={np.mean(holds):.0f}b")
-        ax3.set_xlabel("Bars held (H1)")
+        pd.Series([t.bars_held for t in trades]
+                  ).hist(ax=ax3, bins=30,
+                         color='darkorange',
+                         edgecolor='white',
+                         alpha=0.8)
+        ah = stats['avg_hold']
+        ax3.set_title(f"Hold Periods (avg={ah:.0f}b)")
+        ax3.set_xlabel("Bars (H1)")
         ax3.grid(True, alpha=0.3)
 
-        plt.savefig(
-            os.path.join(
-                OUTPUT_DIR,
-                f"bt_{sym1}_{sym2}.png"),
-            dpi=120, bbox_inches='tight')
+        fname = os.path.join(
+            OUTPUT_DIR,
+            f"bt_{sym1}_{sym2}.png")
+        plt.savefig(fname, dpi=120,
+                    bbox_inches='tight')
         plt.close()
-        print(f"    [PLOT] bt_{sym1}_{sym2}.png")
+        print(f"    [PLOT] {fname}")
 
     except Exception as e:
         print(f"    [PLOT ERR] {e}")
@@ -671,27 +601,22 @@ def plot_portfolio(results: list):
     curves = [
         (r['pair'], r['equity'])
         for r in results
-        if r.get('equity') is not None
-        and len(r.get('equity', [])) > 10
+        if (r.get('equity') is not None
+            and len(r.get('equity', [])) > 10)
     ]
-
     if not curves:
         return
 
     frames = []
     for pair, eq in curves:
-        eq_c = eq.copy()
-        eq_c = eq_c[~eq_c.index.duplicated(
-                        keep='last')]
-        eq_c = eq_c.sort_index()
-        frames.append(eq_c.rename(pair))
+        eq = eq[~eq.index.duplicated(keep='last')]
+        eq = eq.sort_index()
+        frames.append(eq.rename(pair))
 
     combined  = pd.concat(frames, axis=1)
     combined  = combined.ffill().fillna(1.0)
     portfolio = combined.mean(axis=1)
-
-    if portfolio.iloc[0] != 0:
-        portfolio = portfolio / portfolio.iloc[0]
+    portfolio = portfolio / portfolio.iloc[0]
 
     ret    = portfolio.pct_change().dropna()
     sharpe = float(
@@ -701,10 +626,9 @@ def plot_portfolio(results: list):
     max_dd = float(((portfolio - rm) / rm).min())
     tot_r  = float(portfolio.iloc[-1] - 1.0)
 
-    fig, axes = plt.subplots(
-        2, 1, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
     fig.suptitle(
-        f"Portfolio: {len(curves)} pairs  "
+        f"Portfolio {len(curves)} pairs  "
         f"Sharpe={sharpe:.2f}  "
         f"MaxDD={max_dd:.1%}  "
         f"Return={tot_r:.1%}",
@@ -713,12 +637,12 @@ def plot_portfolio(results: list):
     combined.plot(ax=axes[0], lw=0.8, alpha=0.7)
     axes[0].axhline(1.0, color='k',
                     ls='--', lw=0.8)
-    axes[0].set_title("Individual Pair Curves")
+    axes[0].set_title("Individual Pairs")
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
     portfolio.plot(ax=axes[1],
-                   color='darkblue', lw=1.5)
+                   color='darkblue', lw=2)
     axes[1].axhline(1.0, color='k',
                     ls='--', lw=0.8)
     axes[1].fill_between(
@@ -739,21 +663,21 @@ def plot_portfolio(results: list):
     plt.close()
 
     print(f"\n  PORTFOLIO:")
-    print(f"    Pairs:   {len(curves)}")
-    print(f"    Sharpe:  {sharpe:.2f}")
-    print(f"    Max DD:  {max_dd:.1%}")
-    print(f"    Return:  {tot_r:.1%}")
+    print(f"    Pairs  : {len(curves)}")
+    print(f"    Sharpe : {sharpe:.2f}")
+    print(f"    Max DD : {max_dd:.1%}")
+    print(f"    Return : {tot_r:.1%}")
 
     with open(os.path.join(
             OUTPUT_DIR, "portfolio_stats.json"),
               'w') as f:
         json.dump({
-            'version'  : BT_VERSION,
-            'n_pairs'  : len(curves),
-            'sharpe'   : round(sharpe, 4),
-            'max_dd'   : round(max_dd, 4),
-            'return'   : round(tot_r, 4),
-            'pairs'    : [p for p, _ in curves],
+            'version': BT_VERSION,
+            'n_pairs': len(curves),
+            'sharpe' : round(sharpe, 4),
+            'max_dd' : round(max_dd, 4),
+            'return' : round(tot_r, 4),
+            'pairs'  : [p for p, _ in curves],
         }, f, indent=2)
 
 
@@ -763,29 +687,29 @@ def plot_portfolio(results: list):
 def run_all_backtests(timeframe: str = "H1"):
     print(f"\n{'='*60}")
     print(f"  {BT_VERSION}")
-    print(f"  Entry:   ±{ENTRY_Z}σ")
-    print(f"  Exit:    {EXIT_Z}σ  (FIX: was 0.0)")
-    print(f"  Stop:    ±{STOP_Z}σ")
-    print(f"  MinHold: {MIN_HOLD_BARS} bars  "
-          f"(FIX: was 2)")
-    print(f"  Step:    {STEP_BARS} = Test={TEST_BARS}  "
-          f"(FIX: no overlap)")
+    print(f"  Architecture: Fixed OLS hedge ratio")
+    print(f"  OLS fit on training bars only")
+    print(f"  Fixed ratio applied to test bars (OOS)")
+    print(f"  Z-score uses training mean/std only")
+    print(f"  Zero window overlap (step = test_bars)")
+    print(f"  Entry: ±{ENTRY_Z}σ  Exit: {EXIT_Z}σ  "
+          f"Stop: ±{STOP_Z}σ")
     print(f"{'='*60}")
 
     vp_file = os.path.join(
         OUTPUT_DIR, "valid_pairs.json")
     if not os.path.exists(vp_file):
         print("[ERR] valid_pairs.json not found")
-        print("      Run pairs_research.py first")
         return []
 
     with open(vp_file) as f:
         valid_pairs = json.load(f)
 
-    print(f"\n  Loaded {len(valid_pairs)} valid pairs")
+    print(f"\n  {len(valid_pairs)} valid pairs loaded")
 
     all_results  = []
     summary_rows = []
+    min_bars     = TRAIN_BARS + TEST_BARS + 100
 
     for p in valid_pairs:
         sym1 = p['symbol1']
@@ -794,17 +718,15 @@ def run_all_backtests(timeframe: str = "H1"):
         s1 = load_price_series(sym1, timeframe)
         s2 = load_price_series(sym2, timeframe)
 
-        min_bars = train_bars + test_bars + 200
-        if len(s1) < min_bars or len(s2) < min_bars:
+        if min(len(s1), len(s2)) < min_bars:
             print(f"  [SKIP] {sym1}/{sym2}: "
-                  f"need {min_bars} bars, "
-                  f"have {min(len(s1),len(s2))}")
+                  f"insufficient data")
             continue
 
         s1a, s2a = align_series(s1, s2)
         if len(s1a) < min_bars:
             print(f"  [SKIP] {sym1}/{sym2}: "
-                  f"insufficient aligned bars")
+                  f"insufficient aligned data")
             continue
 
         try:
@@ -816,11 +738,8 @@ def run_all_backtests(timeframe: str = "H1"):
                 entry_z     = ENTRY_Z,
                 exit_z      = EXIT_Z,
                 stop_z      = STOP_Z,
-                min_hold    = MIN_HOLD_BARS,
-                delta       = DELTA,
                 train_bars  = TRAIN_BARS,
                 test_bars   = TEST_BARS,
-                step_bars   = STEP_BARS,
             )
         except Exception as e:
             print(f"  [ERR] {sym1}/{sym2}: {e}")
@@ -828,33 +747,30 @@ def run_all_backtests(timeframe: str = "H1"):
             continue
 
         if not trades:
-            print(f"  [SKIP] No trades for "
-                  f"{sym1}/{sym2}")
+            print(f"  [SKIP] No trades: {sym1}/{sym2}")
             continue
 
         stats = compute_stats(trades, equity)
-        sanity_check(trades, sym1, sym2,
-                     len(s1a), stats)
+        passed = sanity_check(
+            trades, sym1, sym2, stats)
 
-        plot_results(sym1, sym2, trades,
-                     equity, stats)
+        plot_results(
+            sym1, sym2, trades, equity, stats)
 
-        # Save trade CSV
-        rows = []
-        for t in trades:
-            rows.append({
-                'entry_time'   : str(t.entry_time),
-                'exit_time'    : str(t.exit_time),
-                'direction'    : t.direction,
-                'entry_spread' : t.entry_spread,
-                'exit_spread'  : t.exit_spread,
-                'entry_z'      : round(t.entry_z, 4),
-                'exit_z'       : round(t.exit_z, 4),
-                'exit_reason'  : t.exit_reason,
-                'pnl_spread'   : t.pnl_spread,
-                'pnl_norm'     : round(t.pnl_norm, 6),
-                'bars_held'    : t.bars_held,
-            })
+        # Save CSV
+        rows = [{
+            'entry_time'  : str(t.entry_time),
+            'exit_time'   : str(t.exit_time),
+            'direction'   : t.direction,
+            'entry_z'     : round(t.entry_z, 4),
+            'exit_z'      : round(t.exit_z, 4),
+            'bars_held'   : t.bars_held,
+            'pnl_raw'     : t.pnl_raw,
+            'pnl_norm'    : round(t.pnl_norm, 6),
+            'exit_reason' : t.exit_reason,
+            'spread_std'  : t.spread_std,
+        } for t in trades]
+
         pd.DataFrame(rows).to_csv(
             os.path.join(
                 OUTPUT_DIR,
@@ -862,24 +778,13 @@ def run_all_backtests(timeframe: str = "H1"):
             index=False)
 
         print(f"\n  ══ {sym1}/{sym2} ══")
-        print(f"    Trades    : {stats['n_trades']}")
-        print(f"    Win Rate  : "
-              f"{stats['win_rate']:.1%}")
-        print(f"    PF        : "
-              f"{stats['profit_factor']:.2f}")
-        print(f"    Sharpe    : {stats['sharpe']:.2f}")
-        print(f"    Max DD    : {stats['max_dd']:.1%}")
-        print(f"    Avg Hold  : "
-              f"{stats['avg_hold']:.0f} bars "
-              f"(min={stats['min_hold']} "
-              f"max={stats['max_hold']})")
-        print(f"    PnL (norm): "
-              f"{stats['total_pnl_norm']:.4f} σ-units")
-        print(f"    Exits     : {stats['exit_reasons']}")
+        for k, v in stats.items():
+            print(f"    {k:<16}: {v}")
 
         all_results.append({
-            'pair'  : f"{sym1}/{sym2}",
-            'equity': equity,
+            'pair'         : f"{sym1}/{sym2}",
+            'equity'       : equity,
+            'sanity_passed': passed,
             **stats,
         })
         summary_rows.append({
@@ -890,9 +795,8 @@ def run_all_backtests(timeframe: str = "H1"):
             'sharpe'       : stats['sharpe'],
             'max_dd'       : stats['max_dd'],
             'avg_hold_bars': stats['avg_hold'],
-            'min_hold'     : stats['min_hold'],
+            'sanity_ok'    : passed,
             'half_life'    : p.get('half_life', 0),
-            'eg_pval'      : p.get('eg_pval', 1),
         })
 
     if summary_rows:
@@ -903,21 +807,16 @@ def run_all_backtests(timeframe: str = "H1"):
         print(f"{'='*72}")
         print(df_s.to_string(index=False))
         df_s.to_csv(
-            os.path.join(
-                OUTPUT_DIR,
-                "backtest_summary.csv"),
+            os.path.join(OUTPUT_DIR,
+                         "backtest_summary.csv"),
             index=False)
 
-    if len(all_results) >= 1:
+    if all_results:
         plot_portfolio(all_results)
 
     print(f"\n  [DONE] {BT_VERSION}")
     return all_results
 
-
-# Reference for calling from outside
-train_bars = TRAIN_BARS
-test_bars  = TEST_BARS
 
 if __name__ == "__main__":
     run_all_backtests(timeframe="H1")
