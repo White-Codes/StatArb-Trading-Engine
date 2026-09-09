@@ -1,15 +1,13 @@
 {
   "version": "backtest-v6.1",
-  "n_pairs": 6,
-  "sharpe": 0.2766,
-  "max_dd": -0.2443,
-  "return": 0.2211,
+  "n_pairs": 4,
+  "sharpe": 0.8537,
+  "max_dd": -0.1313,
+  "return": 0.8056,
   "pairs": [
-    "NZDUSD/USDCAD",
     "EURUSD/USDCHF",
     "EURUSD/GBPUSD",
     "GBPUSD/USDCHF",
-    "USDCAD/USDCHF",
-    "NZDUSD/USDCHF"
+    "USDCAD/USDCHF"
   ]
 }
