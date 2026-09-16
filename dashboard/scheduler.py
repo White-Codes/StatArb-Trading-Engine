@@ -25,10 +25,15 @@ def run_once(
     Run pipeline once and update Sheets.
     Called by GitHub Actions every hour.
     """
+    # Pre-compute timestamp — avoids nested
+    # f-string syntax error in Python < 3.12
+    now_str = datetime.now(
+        timezone.utc).strftime(
+        '%Y-%m-%d %H:%M UTC')
+
     print(f"\n{'='*55}")
-    print(f"  StatArb → Google Sheets")
-    print(f"  {datetime.now(timezone.utc)"
-          f".strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  StatArb -> Google Sheets")
+    print(f"  {now_str}")
     print(f"{'='*55}")
 
     # ── Load credentials from env ─────────────
@@ -39,19 +44,21 @@ def run_once(
 
     if not creds_raw:
         raise ValueError(
-            "GOOGLE_CREDENTIALS env var not set.\n"
+            "GOOGLE_CREDENTIALS env var "
+            "not set.\n"
             "Add it to GitHub Secrets.")
     if not sheet_id:
         raise ValueError(
-            "GOOGLE_SHEET_ID env var not set.\n"
+            "GOOGLE_SHEET_ID env var "
+            "not set.\n"
             "Add it to GitHub Secrets.")
 
     try:
         creds_dict = json.loads(creds_raw)
     except json.JSONDecodeError as e:
         raise ValueError(
-            f"GOOGLE_CREDENTIALS is not valid "
-            f"JSON: {e}")
+            f"GOOGLE_CREDENTIALS is not "
+            f"valid JSON: {e}")
 
     # ── Run pipeline ──────────────────────────
     results = run_full_pipeline(
@@ -72,9 +79,10 @@ def run_once(
     )
     writer.write_all(results)
 
-    print(f"\n  [DONE] "
-          f"{datetime.now(timezone.utc)"
-          f".strftime('%Y-%m-%d %H:%M UTC')}")
+    done_str = datetime.now(
+        timezone.utc).strftime(
+        '%Y-%m-%d %H:%M UTC')
+    print(f"\n  [DONE] {done_str}")
 
 
 if __name__ == "__main__":
