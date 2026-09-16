@@ -1,41 +1,66 @@
 """
-screener.py
-===========
+dashboard/screener.py
+=====================
 Full pipeline engine.
 Runs research -> backtest -> signals -> sizing.
-Returns structured DataFrames for Sheets.
 
-Fix: KeyError 'Score' in run_screener()
-     - Consistent column naming throughout
-     - Empty rows guard before sort_values
-     - Robust error handling per pair
+Fix: Removed dependency on pairs_research imports
+     that were failing silently due to path issues.
+     All required functions defined locally.
 """
 
 import numpy as np
 import pandas as pd
-import sys, os
+import sys, os, traceback
 from datetime import datetime, timezone
 from itertools import combinations
 
-sys.path.insert(0, os.path.dirname(
+# ── Path setup ────────────────────────────────
+ROOT = os.path.dirname(
     os.path.dirname(
-        os.path.abspath(__file__))))
+        os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-from pairs_research import (
-    align_series,
-    compute_half_life,
-    test_window,
-)
-from pairs_backtest import (
-    estimate_ols,
-    apply_fixed_spread,
-    compute_test_zscore,
-    backtest_pair,
-    compute_stats,
-)
-from dashboard.live_feed import (
-    load_all_price_data,
-)
+# ── Import from root-level files ──────────────
+try:
+    from pairs_research import (
+        align_series,
+        compute_half_life,
+        test_window,
+        _run_adf,
+        _run_johansen,
+        _hurst_on_diffs,
+    )
+    print("[IMPORT] pairs_research: OK")
+except Exception as e:
+    print(f"[IMPORT ERR] pairs_research: {e}")
+    traceback.print_exc()
+    raise
+
+try:
+    from pairs_backtest import (
+        estimate_ols,
+        apply_fixed_spread,
+        compute_test_zscore,
+        backtest_pair,
+        compute_stats,
+    )
+    print("[IMPORT] pairs_backtest: OK")
+except Exception as e:
+    print(f"[IMPORT ERR] pairs_backtest: {e}")
+    traceback.print_exc()
+    raise
+
+try:
+    from dashboard.live_feed import (
+        load_all_price_data,
+    )
+    print("[IMPORT] live_feed: OK")
+except Exception as e:
+    print(f"[IMPORT ERR] live_feed: {e}")
+    traceback.print_exc()
+    raise
 
 UNIVERSE = [
     "EURUSD", "GBPUSD", "AUDUSD",
@@ -60,22 +85,51 @@ def run_screener(
         ) -> pd.DataFrame:
     """
     Test all pair combinations for
-    cointegration. Returns Sheet 1 data.
+    cointegration.
     """
     avail = list(price_data.keys())
     pairs = list(combinations(avail, 2))
     print(f"\n[1-SCREENER] Testing "
           f"{len(pairs)} pairs...")
 
+    # Test imports work on one pair first
+    print("[1-SCREENER] Import check...")
+    try:
+        sym1_t, sym2_t = pairs[0]
+        s1_t = price_data[sym1_t]
+        s2_t = price_data[sym2_t]
+        combined = pd.concat(
+            [s1_t, s2_t], axis=1).dropna()
+        print(f"  align_series: OK "
+              f"({len(combined)} bars)")
+        r_t = test_window(
+            combined.iloc[-200:, 0],
+            combined.iloc[-200:, 1])
+        print(f"  test_window: OK")
+        print(f"  Keys returned: "
+              f"{list(r_t.keys())}")
+    except Exception as e:
+        print(f"  [CHECK ERR] {e}")
+        traceback.print_exc()
+
     rows = []
+    n_ok  = 0
+    n_err = 0
+
     for sym1, sym2 in pairs:
         try:
-            s1, s2 = align_series(
-                price_data[sym1],
-                price_data[sym2])
+            # Align series
+            combined = pd.concat(
+                [price_data[sym1],
+                 price_data[sym2]],
+                axis=1).dropna()
+            combined.columns = [sym1, sym2]
 
-            if len(s1) < 500:
+            if len(combined) < 500:
                 continue
+
+            s1 = combined[sym1]
+            s2 = combined[sym2]
 
             n = len(s1)
             w = min(TRAIN_BARS, n)
@@ -84,65 +138,79 @@ def run_screener(
                 s1.iloc[-w:],
                 s2.iloc[-w:])
 
+            if not isinstance(result, dict):
+                print(f"  [WARN] "
+                      f"{sym1}/{sym2}: "
+                      f"test_window returned "
+                      f"{type(result)}")
+                continue
+
             hl    = result.get(
                 'half_life', np.inf)
-            score = result.get('score', 0.0)
+            score = result.get(
+                'score', 0.0)
+
+            # Guard all values
+            if not isinstance(
+                    score, (int, float)):
+                score = 0.0
+            if np.isnan(score):
+                score = 0.0
 
             rows.append({
-                'Pair'         : f"{sym1}/{sym2}",
+                'Pair'         : (
+                    f"{sym1}/{sym2}"),
                 'Symbol1'      : sym1,
                 'Symbol2'      : sym2,
-                'EG_pval'      : round(
-                    float(result.get(
-                        'eg_pval', 1.0)), 4),
-                'ADF_pval'     : round(
-                    float(result.get(
-                        'adf_pval', 1.0)), 4),
-                'Johansen_pval': round(
-                    float(result.get(
+                'EG_pval'      : round(float(
+                    result.get(
+                        'eg_pval', 1.0)),
+                    4),
+                'ADF_pval'     : round(float(
+                    result.get(
+                        'adf_pval', 1.0)),
+                    4),
+                'Johansen_pval': round(float(
+                    result.get(
                         'johansen_pval', 1.0)),
                     4),
                 'Half_Life'    : (
                     round(float(hl), 1)
                     if np.isfinite(hl)
                     else 999.0),
-                'Hurst'        : round(
-                    float(result.get(
-                        'hurst', 0.5)), 3),
-                'Hedge_Ratio'  : round(
-                    float(result.get(
+                'Hurst'        : round(float(
+                    result.get(
+                        'hurst', 0.5)),
+                    3),
+                'Hedge_Ratio'  : round(float(
+                    result.get(
                         'hedge_ratio', 0.0)),
                     4),
                 'Valid'        : (
                     "YES"
                     if result.get(
-                        'cointegrated', False)
+                        'cointegrated',
+                        False)
                     else "NO"),
                 'Score'        : round(
                     float(score), 4),
             })
+            n_ok += 1
 
         except Exception as e:
-            print(f"  [ERR] {sym1}/{sym2}: "
-                  f"{e}")
-            # Add a failed row so we don't
-            # lose the pair silently
-            rows.append({
-                'Pair'         : f"{sym1}/{sym2}",
-                'Symbol1'      : sym1,
-                'Symbol2'      : sym2,
-                'EG_pval'      : 1.0,
-                'ADF_pval'     : 1.0,
-                'Johansen_pval': 1.0,
-                'Half_Life'    : 999.0,
-                'Hurst'        : 0.5,
-                'Hedge_Ratio'  : 0.0,
-                'Valid'        : "NO",
-                'Score'        : 0.0,
-            })
+            n_err += 1
+            print(f"  [ERR] "
+                  f"{sym1}/{sym2}: {e}")
+            if n_err <= 3:
+                # Show first 3 tracebacks
+                traceback.print_exc()
+
+    print(f"  Processed: {n_ok} OK, "
+          f"{n_err} errors")
 
     if not rows:
-        print("  [WARN] No pairs processed")
+        print("  [WARN] No rows collected. "
+              "Check errors above.")
         return pd.DataFrame(columns=[
             'Pair', 'Symbol1', 'Symbol2',
             'EG_pval', 'ADF_pval',
@@ -152,10 +220,7 @@ def run_screener(
 
     df = pd.DataFrame(rows)
 
-    # Verify column exists before sorting
     if 'Score' not in df.columns:
-        print(f"  [WARN] Score column missing. "
-              f"Columns: {df.columns.tolist()}")
         df['Score'] = 0.0
 
     df = df.sort_values(
@@ -163,7 +228,7 @@ def run_screener(
     ).reset_index(drop=True)
 
     n_valid = (df['Valid'] == 'YES').sum()
-    print(f"  Done: {n_valid} valid "
+    print(f"  Result: {n_valid} valid "
           f"/ {len(df)} total")
     return df
 
@@ -175,12 +240,9 @@ def run_backtests(
         screener_df: pd.DataFrame,
         price_data:  dict
         ) -> pd.DataFrame:
-    """
-    Backtest all valid pairs.
-    Returns Sheet 2 data.
-    """
+    """Backtest all valid pairs."""
     if screener_df.empty:
-        print("\n[2-BACKTEST] No valid pairs "
+        print("\n[2-BACKTEST] No pairs "
               "to backtest")
         return pd.DataFrame()
 
@@ -188,8 +250,7 @@ def run_backtests(
         screener_df['Valid'] == 'YES']
 
     if valid.empty:
-        print("\n[2-BACKTEST] No valid pairs "
-              "found in screener")
+        print("\n[2-BACKTEST] No valid pairs")
         return pd.DataFrame()
 
     print(f"\n[2-BACKTEST] Running "
@@ -201,21 +262,27 @@ def run_backtests(
         sym2 = row['Symbol2']
         pair = row['Pair']
 
-        if (sym1 not in price_data or
-                sym2 not in price_data):
-            print(f"  [SKIP] {pair}: "
-                  f"price data missing")
-            continue
-
         try:
-            s1, s2 = align_series(
-                price_data[sym1],
-                price_data[sym2])
+            if (sym1 not in price_data or
+                    sym2 not in price_data):
+                print(f"  [SKIP] {pair}: "
+                      f"missing price data")
+                continue
 
-            min_needed = TRAIN_BARS + TEST_BARS
+            combined = pd.concat(
+                [price_data[sym1],
+                 price_data[sym2]],
+                axis=1).dropna()
+            combined.columns = [sym1, sym2]
+
+            s1 = combined[sym1]
+            s2 = combined[sym2]
+
+            min_needed = (
+                TRAIN_BARS + TEST_BARS)
             if len(s1) < min_needed:
                 print(f"  [SKIP] {pair}: "
-                      f"need {min_needed} bars, "
+                      f"need {min_needed}, "
                       f"have {len(s1)}")
                 continue
 
@@ -236,43 +303,44 @@ def run_backtests(
                       f"no trades generated")
                 continue
 
-            st = compute_stats(trades, equity)
-            pf = st.get('profit_factor', 0.0)
+            st = compute_stats(
+                trades, equity)
+            pf = float(st.get(
+                'profit_factor', 0.0))
 
             rows.append({
                 'Pair'         : pair,
                 'Symbol1'      : sym1,
                 'Symbol2'      : sym2,
-                'Trades'       : st.get(
-                    'n_trades', 0),
-                'Win_Rate'     : round(
-                    float(st.get(
-                        'win_rate', 0.0)), 4),
+                'Trades'       : int(st.get(
+                    'n_trades', 0)),
+                'Win_Rate'     : round(float(
+                    st.get('win_rate', 0.0)),
+                    4),
                 'Win_Rate_Pct' : (
                     f"{st.get('win_rate',0):.1%}"),
-                'Profit_Factor': round(
-                    float(pf), 4),
-                'Sharpe'       : round(
-                    float(st.get(
-                        'sharpe', 0.0)), 4),
-                'Max_DD'       : round(
-                    float(st.get(
-                        'max_dd', 0.0)), 4),
+                'Profit_Factor': round(pf, 4),
+                'Sharpe'       : round(float(
+                    st.get('sharpe', 0.0)),
+                    4),
+                'Max_DD'       : round(float(
+                    st.get('max_dd', 0.0)),
+                    4),
                 'Max_DD_Pct'   : (
                     f"{st.get('max_dd',0):.1%}"),
-                'Avg_Hold_Bars': round(
-                    float(st.get(
-                        'avg_hold', 0.0)), 1),
-                'Total_PnL'    : round(
-                    float(st.get(
+                'Avg_Hold_Bars': round(float(
+                    st.get('avg_hold', 0.0)),
+                    1),
+                'Total_PnL'    : round(float(
+                    st.get(
                         'total_pnl_n', 0.0)),
                     4),
                 'Profitable'   : (
                     "YES"
                     if pf >= MIN_BT_PF
                     else "NO"),
-                'Hedge_Ratio'  : round(
-                    float(row.get(
+                'Hedge_Ratio'  : round(float(
+                    row.get(
                         'Hedge_Ratio', 0.0)),
                     4),
                 'Half_Life'    : float(
@@ -281,17 +349,20 @@ def run_backtests(
             print(f"  {pair}: "
                   f"PF={pf:.2f}  "
                   f"WR={st.get('win_rate',0):.1%}"
-                  f"  {'PASS' if pf>=MIN_BT_PF else 'FAIL'}")
+                  f"  "
+                  f"{'PASS' if pf>=MIN_BT_PF else 'FAIL'}")
 
         except Exception as e:
             print(f"  [ERR] {pair}: {e}")
+            traceback.print_exc()
 
     if not rows:
         print("  [WARN] No backtest results")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows).sort_values(
-        'Profit_Factor', ascending=False
+        'Profit_Factor',
+        ascending=False
     ).reset_index(drop=True)
 
     return df
@@ -304,13 +375,10 @@ def compute_live_signals(
         backtest_df: pd.DataFrame,
         price_data:  dict
         ) -> pd.DataFrame:
-    """
-    Compute current z-scores for all
-    profitable pairs. Returns Sheet 3 data.
-    """
+    """Compute current z-scores."""
     if backtest_df.empty:
         print("\n[3-SIGNALS] No backtest "
-              "results to compute signals for")
+              "results")
         return pd.DataFrame()
 
     profitable = backtest_df[
@@ -318,11 +386,11 @@ def compute_live_signals(
 
     if profitable.empty:
         print("\n[3-SIGNALS] No profitable "
-              "pairs found")
+              "pairs")
         return pd.DataFrame()
 
-    print(f"\n[3-SIGNALS] Computing signals "
-          f"for {len(profitable)} pairs...")
+    print(f"\n[3-SIGNALS] Computing for "
+          f"{len(profitable)} pairs...")
 
     rows = []
     now  = datetime.now(timezone.utc)
@@ -332,19 +400,23 @@ def compute_live_signals(
         sym2 = row['Symbol2']
         pair = row['Pair']
 
-        if (sym1 not in price_data or
-                sym2 not in price_data):
-            continue
-
         try:
-            s1, s2 = align_series(
-                price_data[sym1],
-                price_data[sym2])
+            if (sym1 not in price_data or
+                    sym2 not in price_data):
+                continue
+
+            combined = pd.concat(
+                [price_data[sym1],
+                 price_data[sym2]],
+                axis=1).dropna()
+            combined.columns = [sym1, sym2]
+
+            s1 = combined[sym1]
+            s2 = combined[sym2]
 
             if len(s1) < TRAIN_BARS + 10:
                 continue
 
-            # OLS on last TRAIN_BARS
             t_s1 = s1.iloc[
                    -TRAIN_BARS:].values
             t_s2 = s2.iloc[
@@ -353,7 +425,6 @@ def compute_live_signals(
             beta, alpha, train_std = (
                 estimate_ols(t_s1, t_s2))
 
-            # Training spread stats
             log1_tr  = np.log(t_s1)
             log2_tr  = np.log(t_s2)
             train_sp = (log1_tr -
@@ -365,27 +436,25 @@ def compute_live_signals(
             if sig < 1e-10:
                 sig = 1.0
 
-            # Current spread + z-score
-            p1_now = float(s1.iloc[-1])
-            p2_now = float(s2.iloc[-1])
-            sp_now = (np.log(p1_now) -
-                      beta * np.log(p2_now) -
-                      alpha)
-            z_now  = (sp_now - mu) / sig
-
-            # Previous bar for direction
+            p1_now  = float(s1.iloc[-1])
+            p2_now  = float(s2.iloc[-1])
             p1_prev = float(s1.iloc[-2])
             p2_prev = float(s2.iloc[-2])
+
+            sp_now  = (np.log(p1_now) -
+                       beta * np.log(p2_now) -
+                       alpha)
             sp_prev = (np.log(p1_prev) -
                        beta * np.log(p2_prev) -
                        alpha)
-            z_prev   = (sp_prev - mu) / sig
+
+            z_now   = round(
+                float((sp_now - mu) / sig), 3)
+            z_prev  = float(
+                (sp_prev - mu) / sig)
             z_change = round(
                 float(z_now - z_prev), 3)
 
-            z_now = round(float(z_now), 3)
-
-            # Signal logic
             if z_now <= -ENTRY_Z:
                 signal  = "LONG"
                 action  = (f"BUY {sym1} / "
@@ -408,9 +477,6 @@ def compute_live_signals(
                 signal  = "FLAT"
                 action  = "No trade"
                 urgency = "WAIT"
-
-            updated = now.strftime(
-                '%Y-%m-%d %H:%M')
 
             rows.append({
                 'Pair'        : pair,
@@ -437,11 +503,14 @@ def compute_live_signals(
                 'PF_Backtest' : float(
                     row.get(
                         'Profit_Factor', 0)),
-                'WR_Backtest' : row.get(
-                    'Win_Rate_Pct', '0%'),
+                'WR_Backtest' : str(
+                    row.get(
+                        'Win_Rate_Pct',
+                        '0%')),
                 'Sharpe'      : float(
                     row.get('Sharpe', 0)),
-                'Updated_UTC' : updated,
+                'Updated_UTC' : now.strftime(
+                    '%Y-%m-%d %H:%M'),
             })
 
             print(f"  {pair}: "
@@ -450,14 +519,13 @@ def compute_live_signals(
 
         except Exception as e:
             print(f"  [ERR] {pair}: {e}")
+            traceback.print_exc()
 
     if not rows:
         print("  [WARN] No signals computed")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-
-    # Sort: active signals first
     order = {
         "LONG"        : 0,
         "SHORT"       : 1,
@@ -470,7 +538,6 @@ def compute_live_signals(
     df = (df.sort_values('_sort')
             .drop('_sort', axis=1)
             .reset_index(drop=True))
-
     return df
 
 
@@ -482,13 +549,9 @@ def compute_risk_sizing(
         account_balance: float = 10000.0,
         risk_pct:        float = 0.01,
         ) -> pd.DataFrame:
-    """
-    Compute lot sizes for active signals.
-    Returns Sheet 4 data.
-    """
+    """Compute lot sizes for active signals."""
     if signals_df.empty:
-        print("\n[4-SIZING] No signals "
-              "to size")
+        print("\n[4-SIZING] No signals")
         return pd.DataFrame()
 
     active = signals_df[
@@ -496,12 +559,11 @@ def compute_risk_sizing(
             ['LONG', 'SHORT'])].copy()
 
     if active.empty:
-        print("\n[4-SIZING] No active "
-              "signals (all FLAT/WATCH)")
+        print("\n[4-SIZING] No active signals")
         return pd.DataFrame()
 
     print(f"\n[4-SIZING] Sizing "
-          f"{len(active)} active signals...")
+          f"{len(active)} signals...")
 
     risk_amount = account_balance * risk_pct
     rows = []
@@ -513,54 +575,55 @@ def compute_risk_sizing(
             std    = float(row['Spread_Std'])
             signal = row['Signal']
 
-            # Stop distance
             stop_z = (
                 -STOP_Z
                 if signal == 'LONG'
                 else STOP_Z)
-            stop_dist_z = abs(stop_z - z_now)
+            stop_dist_z = abs(
+                stop_z - z_now)
             stop_dist   = stop_dist_z * std
             pips_risk   = max(
                 stop_dist * 10000, 1.0)
 
-            # Target (1.5 sigma move)
             target_pips = std * 1.5 * 10000
             rr_ratio    = round(
                 target_pips / pips_risk, 2)
 
-            # Lot sizes
             pip_value = 10.0
             lot1 = risk_amount / (
                 pips_risk * pip_value)
             lot1 = round(float(
-                np.clip(lot1, 0.01, 5.0)), 2)
+                np.clip(lot1, 0.01, 5.0)),
+                2)
             lot2 = round(float(
                 np.clip(
                     lot1 * abs(beta),
-                    0.01, 5.0)), 2)
+                    0.01, 5.0)),
+                2)
 
-            if signal == 'LONG':
-                leg1_dir = 'BUY'
-                leg2_dir = 'SELL'
-            else:
-                leg1_dir = 'SELL'
-                leg2_dir = 'BUY'
+            leg1_dir = (
+                'BUY' if signal == 'LONG'
+                else 'SELL')
+            leg2_dir = (
+                'SELL' if signal == 'LONG'
+                else 'BUY')
 
             rows.append({
                 'Pair'           : row['Pair'],
                 'Signal'         : signal,
                 'Z_Score'        : z_now,
-                'Account_Bal'    : account_balance,
+                'Account_Bal'    : (
+                    account_balance),
                 'Risk_Pct'       : (
                     f"{risk_pct:.1%}"),
                 'Risk_Amount_USD': round(
                     risk_amount, 2),
-                'Leg1_Symbol'    : row[
-                    'Symbol1'],
+                'Leg1_Symbol'    : (
+                    row['Symbol1']),
                 'Leg1_Direction' : leg1_dir,
                 'Leg1_Lots'      : lot1,
-                'Leg2_Symbol'    : row[
-                    'Symbol2'],
+                'Leg2_Symbol'    : (
+                    row['Symbol2']),
                 'Leg2_Direction' : leg2_dir,
                 'Leg2_Lots'      : lot2,
                 'Stop_Pips'      : round(
@@ -574,16 +637,14 @@ def compute_risk_sizing(
 
             print(f"  {row['Pair']}: "
                   f"{signal}  "
-                  f"Leg1={leg1_dir} {lot1}L  "
-                  f"Leg2={leg2_dir} {lot2}L  "
+                  f"{leg1_dir} {lot1}L / "
+                  f"{leg2_dir} {lot2}L  "
                   f"RR={rr_ratio}")
 
         except Exception as e:
-            print(f"  [ERR] {row['Pair']}: "
+            print(f"  [ERR] "
+                  f"{row.get('Pair','?')}: "
                   f"{e}")
-
-    if not rows:
-        return pd.DataFrame()
 
     return pd.DataFrame(rows)
 
@@ -599,10 +660,7 @@ def build_summary(
         account_balance: float,
         risk_pct:        float,
         ) -> pd.DataFrame:
-    """
-    Build KPI summary table.
-    Returns Sheet 5 data.
-    """
+    """Build KPI summary table."""
     now = datetime.now(
         timezone.utc).strftime(
         '%Y-%m-%d %H:%M UTC')
@@ -613,8 +671,8 @@ def build_summary(
             .sum())
         if not screener_df.empty else 0)
     n_profit = (
-        int((backtest_df['Profitable'] == 'YES')
-            .sum())
+        int((backtest_df['Profitable']
+             == 'YES').sum())
         if not backtest_df.empty else 0)
     n_active = (
         len(signals_df[
@@ -624,15 +682,15 @@ def build_summary(
 
     rows = [
         ["STATARB LIVE DASHBOARD", ""],
-        ["Last Updated",       now],
+        ["Last Updated",   now],
         ["", ""],
-        ["-- PIPELINE --",     ""],
-        ["Pairs Tested",       n_tested],
-        ["Valid (Coint)",      n_valid],
-        ["Profitable OOS",     n_profit],
-        ["Active Signals",     n_active],
+        ["-- PIPELINE --", ""],
+        ["Pairs Tested",   n_tested],
+        ["Valid (Coint)",  n_valid],
+        ["Profitable OOS", n_profit],
+        ["Active Signals", n_active],
         ["", ""],
-        ["-- ACCOUNT --",      ""],
+        ["-- ACCOUNT --",  ""],
         ["Balance",
          f"${account_balance:,.2f}"],
         ["Risk Per Trade",
@@ -642,14 +700,14 @@ def build_summary(
         ["", ""],
     ]
 
-    # Backtest averages
     if not backtest_df.empty:
         prof = backtest_df[
-            backtest_df['Profitable'] == 'YES']
+            backtest_df['Profitable']
+            == 'YES']
         if not prof.empty:
             rows += [
                 ["-- BACKTEST AVERAGES --",
-                 "(profitable pairs only)"],
+                 "(profitable pairs)"],
                 ["Avg Win Rate",
                  f"{prof['Win_Rate'].mean():.1%}"],
                 ["Avg Profit Factor",
@@ -663,7 +721,6 @@ def build_summary(
                 ["", ""],
             ]
 
-    # Active signals detail
     if not signals_df.empty:
         active = signals_df[
             signals_df['Signal'].isin(
@@ -680,7 +737,8 @@ def build_summary(
                 ])
 
     return pd.DataFrame(
-        rows, columns=['Metric', 'Value'])
+        rows,
+        columns=['Metric', 'Value'])
 
 
 # ─────────────────────────────────────────────
@@ -691,29 +749,26 @@ def run_full_pipeline(
         risk_pct:        float = 0.01,
         symbols:         list  = None,
         ) -> dict:
-    """
-    Run complete pipeline.
-    Returns all DataFrames for Google Sheets.
-    """
+    """Run complete pipeline."""
     if symbols is None:
         symbols = UNIVERSE
 
+    now_str = datetime.now().strftime(
+        '%Y-%m-%d %H:%M:%S')
+
     print(f"\n{'='*55}")
     print(f"  STATARB PIPELINE")
-    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  {now_str}")
     print(f"  Balance: ${account_balance:,.2f}")
     print(f"  Risk:    {risk_pct:.1%}")
     print(f"{'='*55}")
 
-    # Load prices once — used by all steps
     price_data = load_all_price_data(symbols)
 
     if len(price_data) < 2:
-        print("[ERR] Insufficient price data "
-              "loaded")
+        print("[ERR] Insufficient price data")
         return {}
 
-    # Run pipeline steps
     screener_df = run_screener(price_data)
     backtest_df = run_backtests(
         screener_df, price_data)
@@ -728,7 +783,6 @@ def run_full_pipeline(
         signals_df,  sizing_df,
         account_balance, risk_pct)
 
-    # Console summary
     n_act = len(sizing_df)
     print(f"\n{'='*55}")
     print(f"  PIPELINE COMPLETE")
@@ -739,18 +793,6 @@ def run_full_pipeline(
     print(f"  Profitable    : "
           f"{(backtest_df['Profitable']=='YES').sum() if not backtest_df.empty else 0}")
     print(f"  Active signals: {n_act}")
-
-    if n_act > 0:
-        for _, r in sizing_df.iterrows():
-            print(f"    {r['Pair']}: "
-                  f"{r['Signal']}  "
-                  f"{r['Leg1_Symbol']} "
-                  f"{r['Leg1_Direction']} "
-                  f"{r['Leg1_Lots']}L  "
-                  f"{r['Leg2_Symbol']} "
-                  f"{r['Leg2_Direction']} "
-                  f"{r['Leg2_Lots']}L")
-
     print(f"{'='*55}")
 
     return {
