@@ -1,0 +1,72 @@
+name: StatArb Live Dashboard
+
+on:
+  # Run every hour at :00
+  schedule:
+    - cron: '0 * * * *'
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      balance:
+        description: 'Account balance (USD)'
+        required: false
+        default: '10000'
+      risk:
+        description: 'Risk per trade (0.01=1%)'
+        required: false
+        default: '0.01'
+  push:
+    branches: [ main ]
+
+jobs:
+  update-dashboard:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Verify setup
+      run: |
+        python -c "
+        import gspread, pandas, numpy
+        import statsmodels, yfinance
+        print('gspread:     ', gspread.__version__)
+        print('pandas:      ', pandas.__version__)
+        print('numpy:       ', numpy.__version__)
+        print('statsmodels: ',
+              statsmodels.__version__)
+        print('yfinance:    ', yfinance.__version__)
+        print('All OK')
+        "
+
+    - name: Run pair research
+      run: python pairs_research.py
+
+    - name: Run backtest
+      run: python pairs_backtest.py
+
+    - name: Update Google Sheets dashboard
+      env:
+        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      run: |
+        python -m dashboard.scheduler \
+          --balance ${{ github.event.inputs.balance || '10000' }} \
+          --risk ${{ github.event.inputs.risk || '0.01' }}
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: statarb-results
+        path: pairs_artifacts/
+        retention-days: 7
