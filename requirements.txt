@@ -1,0 +1,8 @@
+numpy
+pandas
+statsmodels
+matplotlib
+gspread
+google-auth
+yfinance
+openpyxl
