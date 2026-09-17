@@ -83,34 +83,23 @@ MIN_BT_PF  = 1.0
 def run_screener(
         price_data: dict
         ) -> pd.DataFrame:
-    """
-    Test all pair combinations for
-    cointegration.
-    """
+
     avail = list(price_data.keys())
     pairs = list(combinations(avail, 2))
     print(f"\n[1-SCREENER] Testing "
           f"{len(pairs)} pairs...")
 
-    # Test imports work on one pair first
-    print("[1-SCREENER] Import check...")
-    try:
-        sym1_t, sym2_t = pairs[0]
-        s1_t = price_data[sym1_t]
-        s2_t = price_data[sym2_t]
-        combined = pd.concat(
-            [s1_t, s2_t], axis=1).dropna()
-        print(f"  align_series: OK "
-              f"({len(combined)} bars)")
-        r_t = test_window(
-            combined.iloc[-200:, 0],
-            combined.iloc[-200:, 1])
-        print(f"  test_window: OK")
-        print(f"  Keys returned: "
-              f"{list(r_t.keys())}")
-    except Exception as e:
-        print(f"  [CHECK ERR] {e}")
-        traceback.print_exc()
+    # Debug first series structure
+    if price_data:
+        first_k = list(price_data.keys())[0]
+        first_v = price_data[first_k]
+        print(f"  [DEBUG] First series: "
+              f"{first_k} "
+              f"type={type(first_v).__name__} "
+              f"ndim={getattr(first_v,'ndim','?')} "
+              f"len={len(first_v)} "
+              f"index_type="
+              f"{type(first_v.index).__name__}")
 
     rows = []
     n_ok  = 0
@@ -118,18 +107,37 @@ def run_screener(
 
     for sym1, sym2 in pairs:
         try:
-            # Align series
-            combined = pd.concat(
-                [price_data[sym1],
-                 price_data[sym2]],
-                axis=1).dropna()
-            combined.columns = [sym1, sym2]
+            s1_raw = price_data[sym1]
+            s2_raw = price_data[sym2]
 
-            if len(combined) < 500:
+            # Defensive: ensure both are
+            # clean Series before aligning
+            if not isinstance(
+                    s1_raw, pd.Series):
+                raise ValueError(
+                    f"{sym1} is "
+                    f"{type(s1_raw)}, "
+                    f"not Series")
+            if not isinstance(
+                    s2_raw, pd.Series):
+                raise ValueError(
+                    f"{sym2} is "
+                    f"{type(s2_raw)}, "
+                    f"not Series")
+
+            # Align on common timestamps
+            # Use simple inner join
+            df = pd.concat(
+                [s1_raw.rename(sym1),
+                 s2_raw.rename(sym2)],
+                axis=1,
+                join='inner').dropna()
+
+            if len(df) < 500:
                 continue
 
-            s1 = combined[sym1]
-            s2 = combined[sym2]
+            s1 = df[sym1]
+            s2 = df[sym2]
 
             n = len(s1)
             w = min(TRAIN_BARS, n)
@@ -139,21 +147,12 @@ def run_screener(
                 s2.iloc[-w:])
 
             if not isinstance(result, dict):
-                print(f"  [WARN] "
-                      f"{sym1}/{sym2}: "
-                      f"test_window returned "
-                      f"{type(result)}")
                 continue
 
             hl    = result.get(
                 'half_life', np.inf)
-            score = result.get(
-                'score', 0.0)
-
-            # Guard all values
-            if not isinstance(
-                    score, (int, float)):
-                score = 0.0
+            score = float(
+                result.get('score', 0.0))
             if np.isnan(score):
                 score = 0.0
 
@@ -164,28 +163,25 @@ def run_screener(
                 'Symbol2'      : sym2,
                 'EG_pval'      : round(float(
                     result.get(
-                        'eg_pval', 1.0)),
-                    4),
+                        'eg_pval', 1.0)), 4),
                 'ADF_pval'     : round(float(
                     result.get(
-                        'adf_pval', 1.0)),
-                    4),
+                        'adf_pval', 1.0)), 4),
                 'Johansen_pval': round(float(
                     result.get(
-                        'johansen_pval', 1.0)),
-                    4),
+                        'johansen_pval',
+                        1.0)), 4),
                 'Half_Life'    : (
                     round(float(hl), 1)
                     if np.isfinite(hl)
                     else 999.0),
                 'Hurst'        : round(float(
                     result.get(
-                        'hurst', 0.5)),
-                    3),
+                        'hurst', 0.5)), 3),
                 'Hedge_Ratio'  : round(float(
                     result.get(
-                        'hedge_ratio', 0.0)),
-                    4),
+                        'hedge_ratio',
+                        0.0)), 4),
                 'Valid'        : (
                     "YES"
                     if result.get(
@@ -193,24 +189,26 @@ def run_screener(
                         False)
                     else "NO"),
                 'Score'        : round(
-                    float(score), 4),
+                    score, 4),
             })
             n_ok += 1
 
         except Exception as e:
             n_err += 1
-            print(f"  [ERR] "
-                  f"{sym1}/{sym2}: {e}")
             if n_err <= 3:
-                # Show first 3 tracebacks
+                print(f"  [ERR] "
+                      f"{sym1}/{sym2}: {e}")
                 traceback.print_exc()
+            elif n_err == 4:
+                print(f"  [ERR] "
+                      f"(further errors "
+                      f"suppressed)")
 
     print(f"  Processed: {n_ok} OK, "
           f"{n_err} errors")
 
     if not rows:
-        print("  [WARN] No rows collected. "
-              "Check errors above.")
+        print("  [WARN] No rows collected")
         return pd.DataFrame(columns=[
             'Pair', 'Symbol1', 'Symbol2',
             'EG_pval', 'ADF_pval',
@@ -219,7 +217,6 @@ def run_screener(
             'Valid', 'Score'])
 
     df = pd.DataFrame(rows)
-
     if 'Score' not in df.columns:
         df['Score'] = 0.0
 
@@ -231,7 +228,6 @@ def run_screener(
     print(f"  Result: {n_valid} valid "
           f"/ {len(df)} total")
     return df
-
 
 # ─────────────────────────────────────────────
 #  STEP 2: BACKTEST
