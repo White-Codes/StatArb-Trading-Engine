@@ -1,26 +1,30 @@
 name: StatArb Live Dashboard
 
 on:
-  # Run every hour at :00
   schedule:
-    - cron: '0 * * * *'
-  # Allow manual trigger
+    # Every 2 hours — reliable and within
+    # free tier (1080 min/month vs 2000 limit)
+    # Hourly is unreliable on GitHub free tier
+    - cron: '0 */2 * * *'
+
   workflow_dispatch:
     inputs:
       balance:
-        description: 'Account balance (USD)'
+        description: 'Account balance USD'
         required: false
         default: '10000'
       risk:
-        description: 'Risk per trade (0.01=1%)'
+        description: 'Risk per trade 0.01=1%'
         required: false
         default: '0.01'
+
   push:
     branches: [ main ]
 
 jobs:
   update-dashboard:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
     - name: Checkout repository
@@ -31,22 +35,23 @@ jobs:
       with:
         python-version: '3.11'
 
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
 
-    - name: Verify setup
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Verify imports
       run: |
         python -c "
         import gspread, pandas, numpy
         import statsmodels, yfinance
-        print('gspread:     ', gspread.__version__)
-        print('pandas:      ', pandas.__version__)
-        print('numpy:       ', numpy.__version__)
-        print('statsmodels: ',
-              statsmodels.__version__)
-        print('yfinance:    ', yfinance.__version__)
-        print('All OK')
+        print('All imports OK')
         "
 
     - name: Run pair research
@@ -55,7 +60,7 @@ jobs:
     - name: Run backtest
       run: python pairs_backtest.py
 
-    - name: Update Google Sheets dashboard
+    - name: Update Google Sheets
       env:
         GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
@@ -67,6 +72,6 @@ jobs:
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: statarb-results
+        name: statarb-results-${{ github.run_number }}
         path: pairs_artifacts/
         retention-days: 7
