@@ -545,7 +545,17 @@ def compute_risk_sizing(
         account_balance: float = 10000.0,
         risk_pct:        float = 0.01,
         ) -> pd.DataFrame:
-    """Compute lot sizes for active signals."""
+    """
+    Compute lot sizes for active signals.
+
+    Key fix: lot sizes are computed from
+    a fixed pip risk model that is
+    consistent and easy to verify manually.
+
+    For a $10,000 account at 1% risk:
+      Risk amount = $100 per trade
+      Both legs share that $100 risk.
+    """
     if signals_df.empty:
         print("\n[4-SIZING] No signals")
         return pd.DataFrame()
@@ -570,72 +580,119 @@ def compute_risk_sizing(
             z_now  = float(row['Z_Score'])
             std    = float(row['Spread_Std'])
             signal = row['Signal']
+            pair   = row['Pair']
+            sym1   = row['Symbol1']
+            sym2   = row['Symbol2']
 
-            stop_z = (
-                -STOP_Z
-                if signal == 'LONG'
-                else STOP_Z)
-            stop_dist_z = abs(
-                stop_z - z_now)
-            stop_dist   = stop_dist_z * std
-            pips_risk   = max(
-                stop_dist * 10000, 1.0)
+            # ── Stop distance ─────────────────
+            # Distance from entry z to stop z
+            # in spread standard deviation units
+            if signal == 'LONG':
+                # Entered at z < -2.0
+                # Stop at z = -3.5
+                stop_z      = -3.5
+                leg1_dir    = 'BUY'
+                leg2_dir    = 'SELL'
+            else:
+                # Entered at z > +2.0
+                # Stop at z = +3.5
+                stop_z      = 3.5
+                leg1_dir    = 'SELL'
+                leg2_dir    = 'BUY'
 
-            target_pips = std * 1.5 * 10000
-            rr_ratio    = round(
-                target_pips / pips_risk, 2)
+            stop_dist_z = abs(stop_z - z_now)
 
-            pip_value = 10.0
-            lot1 = risk_amount / (
-                pips_risk * pip_value)
+            # Convert spread std to pip risk
+            # spread is in log-price units
+            # 1 log-price unit ≈ 10000 pips
+            # for most FX pairs near 1.0
+            stop_pips = stop_dist_z * std * 10000
+            stop_pips = max(stop_pips, 5.0)
+
+            # ── Leg 1 lot size ────────────────
+            # Standard pip value for 1 lot:
+            # Most USD pairs: $10 per pip
+            pip_value_leg1 = 10.0
+
+            # We risk half the risk_amount
+            # on each leg
+            leg1_risk = risk_amount / 2
+            lot1 = leg1_risk / (
+                stop_pips * pip_value_leg1)
             lot1 = round(float(
-                np.clip(lot1, 0.01, 5.0)),
-                2)
-            lot2 = round(float(
-                np.clip(
-                    lot1 * abs(beta),
-                    0.01, 5.0)),
-                2)
+                np.clip(lot1, 0.01, 5.0)), 2)
 
-            leg1_dir = (
-                'BUY' if signal == 'LONG'
-                else 'SELL')
-            leg2_dir = (
-                'SELL' if signal == 'LONG'
-                else 'BUY')
+            # ── Leg 2 lot size ────────────────
+            # Scaled by absolute beta to hedge
+            # the exposure correctly.
+            # If beta = -2.7, you need 2.7x
+            # more of leg2 to offset leg1.
+            lot2 = lot1 * abs(beta)
+            lot2 = round(float(
+                np.clip(lot2, 0.01, 10.0)), 2)
+
+            # ── Reward estimate ───────────────
+            # Expected profit: spread returns
+            # from z to EXIT_Z = 0.5
+            # Distance = |z_now - 0.5| in sigma
+            if signal == 'LONG':
+                reward_z = abs(z_now - 0.5)
+            else:
+                reward_z = abs(z_now - 0.5)
+
+            target_pips = (
+                reward_z * std * 10000)
+            rr_ratio = round(
+                target_pips /
+                max(stop_pips, 0.1), 2)
+
+            # ── Notes ─────────────────────────
+            beta_note = (
+                "NEGATIVE BETA — inverted "
+                "relationship. Verify "
+                "direction carefully."
+                if beta < 0
+                else "Normal positive "
+                     "relationship.")
 
             rows.append({
-                'Pair'           : row['Pair'],
+                'Pair'           : pair,
                 'Signal'         : signal,
-                'Z_Score'        : z_now,
+                'Z_Score'        : round(
+                    z_now, 3),
+                'Z_to_Stop'      : round(
+                    stop_dist_z, 3),
                 'Account_Bal'    : (
                     account_balance),
                 'Risk_Pct'       : (
                     f"{risk_pct:.1%}"),
-                'Risk_Amount_USD': round(
+                'Risk_USD'       : round(
                     risk_amount, 2),
-                'Leg1_Symbol'    : (
-                    row['Symbol1']),
+                'Leg1_Symbol'    : sym1,
                 'Leg1_Direction' : leg1_dir,
                 'Leg1_Lots'      : lot1,
-                'Leg2_Symbol'    : (
-                    row['Symbol2']),
+                'Leg2_Symbol'    : sym2,
                 'Leg2_Direction' : leg2_dir,
                 'Leg2_Lots'      : lot2,
+                'Beta'           : round(
+                    beta, 4),
                 'Stop_Pips'      : round(
-                    pips_risk, 1),
+                    stop_pips, 1),
                 'Target_Pips'    : round(
                     target_pips, 1),
                 'RR_Ratio'       : rr_ratio,
-                'Beta'           : round(
-                    beta, 4),
+                'Note'           : beta_note,
             })
 
-            print(f"  {row['Pair']}: "
+            print(f"  {pair}: "
                   f"{signal}  "
-                  f"{leg1_dir} {lot1}L / "
-                  f"{leg2_dir} {lot2}L  "
-                  f"RR={rr_ratio}")
+                  f"{sym1} {leg1_dir} "
+                  f"{lot1}L  "
+                  f"{sym2} {leg2_dir} "
+                  f"{lot2}L  "
+                  f"Stop={stop_pips:.0f}pips  "
+                  f"RR={rr_ratio}  "
+                  f"Beta={beta:.3f}")
 
         except Exception as e:
             print(f"  [ERR] "
